@@ -73,6 +73,28 @@ def main() -> None:
     m.save(args.output)
     print(f"Map saved to: {args.output}")
 
+    # 4. Export to GeoJSON for frontend
+    geojson_output = "parking_data.geojson"
+    # Convert lat/lon column if it exists to lists, or just drop it if it causes issues, but GeoJSON handles geometries natively.
+    # lat_lon was added as a tuple, which might not serialize easily in some versions, so we stringify it or drop it
+    if "lat_lon" in gdf.columns:
+        gdf = gdf.drop(columns=["lat_lon"])
+    
+    # Also add a top-level metadata file or just save the GeoJSON
+    gdf.to_file(geojson_output, driver="GeoJSON")
+    
+    import json
+    metadata = {
+        "center": [lat, lon],
+        "radius": args.radius,
+        "total_stalls": total,
+        "features_count": len(gdf)
+    }
+    with open("parking_metadata.json", "w") as f:
+        json.dump(metadata, f)
+        
+    print(f"Data exported to {geojson_output} and parking_metadata.json")
+
 
 if __name__ == "__main__":
     main()
