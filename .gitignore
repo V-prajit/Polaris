@@ -1,8 +1,8 @@
 /parksight/__pycache__
 /yolo/__pycache__
 
-# Ignore datasets and model weights
 /data/
 /runs/
-/models/
 *.pt
+.DS_Store
+scripts/__pycache__
