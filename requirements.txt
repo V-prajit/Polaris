@@ -28,3 +28,7 @@ jupyter>=1.0.0
 # YOLO
 ultralytics>=8.0.0
 filelock>=3.13.0
+
+# API
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0

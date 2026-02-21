@@ -143,3 +143,67 @@ def fetch_street_parking(address, dist=300):
         gdf = gpd.GeoDataFrame()
 
     return gdf, (lat, lon)
+
+
+# --- coordinate-based variants (skip geocoding) ---
+
+def get_parking_data_by_coords(lat, lon, dist=300, tags=None):
+    """fetch osm parking features around (lat, lon) without geocoding"""
+    if tags is None:
+        tags = DEFAULT_TAGS
+
+    gdf = ox.features.features_from_point(
+        center_point=(lat, lon),
+        tags=tags,
+        dist=dist,
+    )
+
+    if gdf.empty:
+        logger.warning("No parking features within %d m of (%.5f, %.5f).", dist, lat, lon)
+        return gdf
+
+    centroids = gdf.geometry.to_crs(epsg=3857).centroid.to_crs(epsg=4326)
+    gdf["lat_lon"] = [(pt.y, pt.x) for pt in centroids]
+    gdf = gdf[gdf.is_valid]
+
+    return gdf
+
+
+def fetch_structured_parking_by_coords(lat, lon, dist=300):
+    """fetch garage / underground features from osm using coordinates"""
+    structure_tags = {
+        "building": ["garage", "garages"],
+        "parking": ["multi-storey", "underground"],
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=structure_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf
+
+
+def fetch_street_parking_by_coords(lat, lon, dist=300):
+    """fetch road segments with parking lane tags using coordinates"""
+    street_tags = {
+        "parking:lane": True,
+        "parking:left": True,
+        "parking:right": True,
+        "parking:both": True,
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=street_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf
