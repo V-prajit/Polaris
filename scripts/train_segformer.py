@@ -109,12 +109,15 @@ class YoloSegDataset(Dataset):
 
         logger.info("YoloSegDataset [%s]: %d pairs", split, len(self.pairs))
 
-        # Shared normalisation transform
-        self._to_tensor = T.Compose([
-            T.Resize((img_size, img_size)),
+        # Normalisation only (augmentations applied manually to keep mask in sync)
+        self._normalize = T.Compose([
             T.ToTensor(),
             T.Normalize(mean=self._MEAN, std=self._STD),
         ])
+        # Color jitter applied to image only (not mask)
+        self._color_jitter = T.ColorJitter(
+            brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05
+        )
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -139,6 +142,37 @@ class YoloSegDataset(Dataset):
             mask[y1:y2, x1:x2] = 1
         return mask
 
+    def _augment(self, image: Image.Image, mask_img: Image.Image):
+        """Apply synchronized spatial augmentations to image + mask."""
+        # Random horizontal flip
+        if torch.rand(1).item() > 0.5:
+            image    = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Random vertical flip
+        if torch.rand(1).item() > 0.5:
+            image    = image.transpose(Image.FLIP_TOP_BOTTOM)
+            mask_img = mask_img.transpose(Image.FLIP_TOP_BOTTOM)
+
+        # Random rotation ±15°
+        angle = (torch.rand(1).item() - 0.5) * 30  # -15 to +15
+        image    = image.rotate(angle,    resample=Image.BILINEAR, expand=False)
+        mask_img = mask_img.rotate(angle, resample=Image.NEAREST,  expand=False)
+
+        # Random scale crop (zoom in 80–100% then resize back)
+        scale = 0.8 + torch.rand(1).item() * 0.2   # 0.80 – 1.00
+        w, h = image.size
+        new_w, new_h = int(w * scale), int(h * scale)
+        left  = torch.randint(0, w - new_w + 1, (1,)).item()
+        top   = torch.randint(0, h - new_h + 1, (1,)).item()
+        image    = image.crop((left, top, left + new_w, top + new_h))
+        mask_img = mask_img.crop((left, top, left + new_w, top + new_h))
+
+        # Color jitter on image only
+        image = self._color_jitter(image)
+
+        return image, mask_img
+
     # ── Dataset interface ────────────────────────────────────────────────────
 
     def __len__(self) -> int:
@@ -154,19 +188,17 @@ class YoloSegDataset(Dataset):
         mask_np = self._bbox_to_mask(lbl_path, img_w, img_h)
         mask_img = Image.fromarray(mask_np * 255)  # 0 or 255
 
-        # Optional random horizontal flip
-        if self.augment and torch.rand(1).item() > 0.5:
-            image    = image.transpose(Image.FLIP_LEFT_RIGHT)
-            mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
+        # Augment (train only)
+        if self.augment:
+            image, mask_img = self._augment(image, mask_img)
 
-        # Resize image and mask to img_size
-        pixel_values = self._to_tensor(image)  # [3, H, W]
+        # Resize to img_size
+        image    = image.resize((self.img_size, self.img_size), resample=Image.BILINEAR)
+        mask_img = mask_img.resize((self.img_size, self.img_size), resample=Image.NEAREST)
 
-        mask_resized = mask_img.resize(
-            (self.img_size, self.img_size), resample=Image.NEAREST
-        )
+        pixel_values = self._normalize(image)  # [3, H, W]
         labels = torch.from_numpy(
-            (np.array(mask_resized) > 127).astype(np.int64)
+            (np.array(mask_img) > 127).astype(np.int64)
         )  # [H, W], values 0/1
 
         return {"pixel_values": pixel_values, "labels": labels}
@@ -439,12 +471,22 @@ def main() -> None:
         return F.cross_entropy(upsampled, labels, weight=class_weights, ignore_index=ignore_index)
 
     # ── Optimiser & scheduler ──────────────────────────────────────────
-    optimizer = AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    # Layer-wise LR decay: encoder backbone gets 0.1× LR, decoder gets full LR.
+    # This is the standard SegFormer fine-tuning recipe — the pretrained encoder
+    # needs gentle updates while the randomly-init'd decoder head learns quickly.
+    core_model_for_params = model.module if is_distributed else model
+    encoder_params = list(core_model_for_params.segformer.parameters())
+    decoder_params = list(core_model_for_params.decode_head.parameters())
+    encoder_ids   = {id(p) for p in encoder_params}
+    other_params  = [p for p in model.parameters() if id(p) not in encoder_ids]
+    param_groups  = [
+        {"params": encoder_params, "lr": args.lr * 0.1},   # pretrained encoder — slow
+        {"params": other_params,   "lr": args.lr},          # decoder + head — full LR
+    ]
+    optimizer = AdamW(param_groups, weight_decay=args.weight_decay)
     total_steps = math.ceil(len(train_loader) / args.grad_accum) * args.epochs
     scheduler = PolynomialLR(optimizer, total_iters=total_steps, power=args.lr_power)
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and "cuda" in device))
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and "cuda" in device))
 
     # ── Training loop ─────────────────────────────────────────────────
     best_miou = 0.0
