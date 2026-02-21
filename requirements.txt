@@ -32,3 +32,7 @@ filelock>=3.13.0
 # API
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+cachetools>=5.3.0
+
+# Grid
+h3>=3.7.0

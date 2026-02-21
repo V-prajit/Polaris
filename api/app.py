@@ -12,6 +12,10 @@ import logging
 from pathlib import Path
 import math
 
+from cachetools import TTLCache, cached
+import h3
+
+
 import geopandas as gpd
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,7 +156,16 @@ def health():
     return {"status": "ok", "model_loaded": _detector is not None}
 
 
+# 10 minute cache, max 100 items
+_estimate_cache = TTLCache(maxsize=100, ttl=600)
+
+def _estimate_cache_key(lat: float, lon: float, radius: int):
+    # cache key rounds to 3 decimal places (~111m) so nearby requests reuse cache
+    return hash((round(lat, 3), round(lon, 3), radius))
+
+
 @app.get("/api/estimate")
+@cached(cache=_estimate_cache, key=_estimate_cache_key)
 def estimate(
     lat: float = Query(..., description="Latitude (WGS84)"),
     lon: float = Query(..., description="Longitude (WGS84)"),
@@ -246,6 +259,113 @@ def estimate(
         "grand_total": grand_total,
         "elapsed_seconds": elapsed,
     })
+
+
+@app.get("/api/macro")
+def macro(
+    min_lat: float = Query(..., description="South boundary (WGS84)"),
+    min_lon: float = Query(..., description="West boundary (WGS84)"),
+    max_lat: float = Query(..., description="North boundary (WGS84)"),
+    max_lon: float = Query(..., description="East boundary (WGS84)"),
+    resolution: int = Query(9, description="H3 grid resolution (e.g. 9 is ~170m radius)"),
+):
+    """
+    City-Wide Heatmap Generator.
+    Splits a bounding box into H3 hexagons and quickly estimates the parking
+    capacity in each hexagon using OSM data + area heuristics.
+    (Skips heavy YOLO inference to allow scanning large areas fast).
+    """
+    t_start = time.time()
+    
+    # 1. build the bounding box polygon
+    poly = h3.LatLngPoly([
+        (min_lat, min_lon),
+        (max_lat, min_lon),
+        (max_lat, max_lon),
+        (min_lat, max_lon),
+    ])
+    
+    # 2. fill with h3 hexagons
+    hexagons = list(h3.polygon_to_cells(poly, res=resolution))
+    if len(hexagons) > 200:
+        return {"error": f"Bounding box too large for resolution {resolution}. Trying to generate {len(hexagons)} cells (max 200). Reduce resolution or shrink bounding box.", "status": 400}
+    
+    grid_features = []
+    
+    # quick area fallback
+    from parksight import config
+    stall_area = config["STALL_AREA_M2"]
+    usable = config["USABLE_FRACTION_SURFACE"]
+    
+    # search radius roughly matches hex size (res 9 ~ 170m radius hex)
+    radius = int(math.sqrt(h3.cell_area(hexagons[0], unit='m^2') / math.pi)) if hexagons else 200
+    
+    for hex_id in hexagons:
+        lat, lon = h3.cell_to_latlng(hex_id)
+        hex_boundary = h3.cell_to_boundary(hex_id)
+        # convert (lat,lon) to (lon,lat) for GeoJSON
+        geojson_coords = [[ [lon, lat] for lat, lon in hex_boundary ]]
+        # close the loop
+        geojson_coords[0].append(geojson_coords[0][0])
+        
+        surface_total = 0
+        structured_total = 0
+        street_total = 0
+        
+        # --- surface ---
+        gdf = get_parking_data_by_coords(lat, lon, dist=radius)
+        if gdf is not None and not gdf.empty:
+            gdf_3857 = gdf.to_crs(epsg=3857)
+            for idx, row in gdf_3857.iterrows():
+                geom = row.geometry
+                tags = row.to_dict()
+                if is_structure(tags):
+                    continue
+                if geom.geom_type in ("Polygon", "MultiPolygon"):
+                    count = int((geom.area / stall_area) * usable)
+                elif geom.geom_type in ("LineString", "MultiLineString"):
+                    count = get_line_count(geom)
+                else:
+                    count = 0
+                surface_total += max(count, 0)
+                
+        # --- structured ---
+        struct_gdf = fetch_structured_parking_by_coords(lat, lon, dist=radius)
+        if not struct_gdf.empty:
+            raw = estimate_structured_parking(struct_gdf)
+            structured_total = sum(r["total_spots"] for r in raw)
+            
+        # --- street ---
+        street_gdf = fetch_street_parking_by_coords(lat, lon, dist=radius)
+        if not street_gdf.empty:
+            raw = estimate_street_parking(street_gdf)
+            street_total = sum(r["total_spots"] for r in raw)
+            
+        total = surface_total + structured_total + street_total
+        
+        grid_features.append({
+            "hex_id": hex_id,
+            "centroid": [lat, lon],
+            "total": total,
+            "surface": surface_total,
+            "structured": structured_total,
+            "street": street_total,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": geojson_coords
+            }
+        })
+        
+    elapsed = round(time.time() - t_start, 2)
+    return {
+        "status": "ok",
+        "bbox": [min_lat, min_lon, max_lat, max_lon],
+        "resolution": resolution,
+        "hex_count": len(hexagons),
+        "radius_used": radius,
+        "grid": grid_features,
+        "elapsed_seconds": elapsed
+    }
 
 
 if __name__ == "__main__":
