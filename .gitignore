@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+/cache
+/frontend/.next
+/parksight/__pycache__
+/yolo/__pycache__
