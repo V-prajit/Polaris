@@ -18,4 +18,5 @@ dependencies = [
     "torch>=2.0.0",
     "transformers>=4.30.0",
     "jupyter>=1.0.0",
+    "ultralytics>=8.0.0",
 ]
