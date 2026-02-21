@@ -216,6 +216,91 @@ class ParkingSegmenter:
 
         return mask
 
+    def segment_with_tta(self, pil_image: Image.Image) -> np.ndarray:
+        """
+        Run segmentation with test-time augmentation (4 orientations).
+
+        Averages probability maps from original, horizontal flip,
+        vertical flip, and both flips for more robust predictions.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        self._load()
+
+        orig_w, orig_h = pil_image.size
+
+        # generate 4 augmented versions
+        augmented = [
+            pil_image,
+            pil_image.transpose(Image.FLIP_LEFT_RIGHT),
+            pil_image.transpose(Image.FLIP_TOP_BOTTOM),
+            pil_image.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM),
+        ]
+
+        prob_sum = None
+
+        for i, aug_img in enumerate(augmented):
+            inputs = self._processor(images=aug_img, return_tensors="pt").to(self.device)
+
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+
+            logits = outputs.logits
+            upsampled = F.interpolate(
+                logits, size=(orig_h, orig_w),
+                mode="bilinear", align_corners=False,
+            )
+            probs = torch.softmax(upsampled, dim=1)  # (1, C, H, W)
+
+            # undo the flip on the probability map
+            if i == 1:
+                probs = torch.flip(probs, dims=[3])
+            elif i == 2:
+                probs = torch.flip(probs, dims=[2])
+            elif i == 3:
+                probs = torch.flip(probs, dims=[2, 3])
+
+            if prob_sum is None:
+                prob_sum = probs
+            else:
+                prob_sum = prob_sum + probs
+
+        avg_probs = prob_sum / 4.0
+        predicted = avg_probs.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        if self.is_finetuned:
+            mask = (predicted == 1).astype(np.uint8)
+        else:
+            mask = np.isin(predicted, list(_ADE20K_PAVEMENT_CLASSES)).astype(np.uint8)
+
+        return mask
+
+    @staticmethod
+    def postprocess_mask(mask, min_blob_px=200):
+        """
+        Clean up a binary parking mask with morphological operations.
+
+        Applies closing (fill small holes), then removes tiny blobs.
+        """
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+        # close small gaps inside parking regions
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # open to remove tiny noise blobs
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # remove connected components smaller than min_blob_px
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            cleaned, connectivity=8
+        )
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] < min_blob_px:
+                cleaned[labels == i] = 0
+
+        return cleaned
+
     # ── Counting ───────────────────────────────────────────────────
 
     def _count_from_mask(

@@ -3,26 +3,24 @@ Fetch parking features from OpenStreetMap and satellite tiles.
 
 Uses OSMnx to geocode addresses and query parking-related OSM features,
 and contextily to fetch Esri World Imagery satellite tiles.
+
+Also provides helpers for structured parking and street parking queries.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import contextily as ctx
 import geopandas as gpd
-import numpy as np
 import osmnx as ox
 from PIL import Image
-from shapely.geometry import base as geom_base
 
 logger = logging.getLogger(__name__)
 
 
-# ── Default OSM tags for parking features ──────────────────────────
-
-DEFAULT_TAGS: dict[str, Any] = {
+# default osm tags for parking features
+DEFAULT_TAGS = {
     "amenity": ["parking", "parking_space"],
     "building": ["garage", "garages"],
     "parking:lane": True,
@@ -32,38 +30,20 @@ DEFAULT_TAGS: dict[str, Any] = {
 }
 
 
-def get_parking_data(
-    address: str,
-    dist: int = 300,
-    tags: dict[str, Any] | None = None,
-) -> tuple[gpd.GeoDataFrame, tuple[float, float]]:
+def get_parking_data(address, dist=300, tags=None):
     """
-    Geocode *address* and fetch OSM parking features within *dist* metres.
+    Geocode address and fetch OSM parking features within dist metres.
 
-    Parameters
-    ----------
-    address : str
-        Human-readable address to geocode (e.g. "Georgia Tech, Atlanta, GA").
-    dist : int
-        Search radius in metres (default 300).
-    tags : dict, optional
-        OSM tag filter.  Defaults to :data:`DEFAULT_TAGS`.
-
-    Returns
-    -------
-    (gdf, (lat, lon))
-        A GeoDataFrame of parking features in EPSG:4326 and the geocoded
-        centre point.
+    Returns (gdf, (lat, lon)).
     """
     if tags is None:
         tags = DEFAULT_TAGS
 
     geocode_result = ox.geocoder.geocode(address)
-    print(geocode_result)
     if not geocode_result:
         raise ValueError(f"Could not geocode address: {address}")
     lat, lon = geocode_result
-    logger.info("Geocoded %s → (%.5f, %.5f)", address, lat, lon)
+    logger.info("Geocoded %s -> (%.5f, %.5f)", address, lat, lon)
 
     gdf = ox.features.features_from_point(
         center_point=(lat, lon),
@@ -82,34 +62,15 @@ def get_parking_data(
     return gdf, (lat, lon)
 
 
-def get_satellite_tile(
-    geometry: geom_base.BaseGeometry,
-    padding_pct: float = 0.10,
-    zoom: int = 19,
-) -> Image.Image:
+def get_satellite_tile(geometry, padding_pct=0.10, zoom=19):
     """
-    Fetch an Esri World Imagery satellite tile covering *geometry*.
+    Fetch an Esri World Imagery satellite tile covering geometry.
 
-    The geometry must be in **Web Mercator (EPSG:3857)**.  A percentage-based
-    padding is added around the bounding box so that the tile has some context.
-
-    Parameters
-    ----------
-    geometry : shapely geometry
-        Feature geometry in EPSG:3857.
-    padding_pct : float
-        Fraction of the bbox size to add as padding (default 0.10).
-    zoom : int
-        Tile zoom level (default 19).
-
-    Returns
-    -------
-    PIL.Image.Image
-        RGB satellite image covering the padded bounding box.
+    The geometry must be in Web Mercator (EPSG:3857).
     """
     if geometry.geom_type == "Point":
         x, y = geometry.x, geometry.y
-        buffer = 50  # metres
+        buffer = 50
         minx, miny, maxx, maxy = x - buffer, y - buffer, x + buffer, y + buffer
     else:
         minx, miny, maxx, maxy = geometry.bounds
@@ -130,3 +91,119 @@ def get_satellite_tile(
     )
 
     return Image.fromarray(img_array)
+
+
+def fetch_structured_parking(address, dist=300):
+    """
+    Fetch garage, underground, and multi-storey parking features from OSM.
+
+    Returns (gdf, (lat, lon)).
+    """
+    lat, lon = ox.geocoder.geocode(address)
+
+    structure_tags = {
+        "building": ["garage", "garages"],
+        "parking": ["multi-storey", "underground"],
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=structure_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf, (lat, lon)
+
+
+def fetch_street_parking(address, dist=300):
+    """
+    Fetch road segments with parking lane tags from OSM.
+
+    Returns (gdf, (lat, lon)).
+    """
+    lat, lon = ox.geocoder.geocode(address)
+
+    street_tags = {
+        "parking:lane": True,
+        "parking:left": True,
+        "parking:right": True,
+        "parking:both": True,
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=street_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf, (lat, lon)
+
+
+# --- coordinate-based variants (skip geocoding) ---
+
+def get_parking_data_by_coords(lat, lon, dist=300, tags=None):
+    """fetch osm parking features around (lat, lon) without geocoding"""
+    if tags is None:
+        tags = DEFAULT_TAGS
+
+    gdf = ox.features.features_from_point(
+        center_point=(lat, lon),
+        tags=tags,
+        dist=dist,
+    )
+
+    if gdf.empty:
+        logger.warning("No parking features within %d m of (%.5f, %.5f).", dist, lat, lon)
+        return gdf
+
+    centroids = gdf.geometry.to_crs(epsg=3857).centroid.to_crs(epsg=4326)
+    gdf["lat_lon"] = [(pt.y, pt.x) for pt in centroids]
+    gdf = gdf[gdf.is_valid]
+
+    return gdf
+
+
+def fetch_structured_parking_by_coords(lat, lon, dist=300):
+    """fetch garage / underground features from osm using coordinates"""
+    structure_tags = {
+        "building": ["garage", "garages"],
+        "parking": ["multi-storey", "underground"],
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=structure_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf
+
+
+def fetch_street_parking_by_coords(lat, lon, dist=300):
+    """fetch road segments with parking lane tags using coordinates"""
+    street_tags = {
+        "parking:lane": True,
+        "parking:left": True,
+        "parking:right": True,
+        "parking:both": True,
+    }
+
+    try:
+        gdf = ox.features.features_from_point(
+            center_point=(lat, lon),
+            tags=street_tags,
+            dist=dist,
+        )
+    except Exception:
+        gdf = gpd.GeoDataFrame()
+
+    return gdf

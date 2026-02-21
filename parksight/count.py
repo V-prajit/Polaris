@@ -13,92 +13,36 @@ All tuneable parameters are loaded from ``config.json`` at package level.
 
 from __future__ import annotations
 
-import json
 import logging
-import math
-from pathlib import Path
-from typing import Union
 
-import contextily as ctx
 import cv2
-import geopandas as gpd
 import numpy as np
 import numpy.typing as npt
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
+from parksight import config, corrected_line_length
+from parksight.fetch import get_satellite_tile
+
 logger = logging.getLogger(__name__)
 
-# ── Load config from package-relative path ─────────────────────────
 
-_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.json"
-
-with _CONFIG_FILE.open(encoding="utf-8") as _f:
-    config: dict = json.load(_f)
-
-
-def get_line_count(geometry: Union[LineString, MultiLineString]) -> int:
-    """
-    Estimate street-parking capacity from a line geometry.
-
-    Converts the geometry to WGS-84 to obtain a latitude-corrected length
-    in metres, then divides by the average car length.
-
-    Parameters
-    ----------
-    geometry : LineString | MultiLineString
-        Street-parking geometry in EPSG:3857.
-
-    Returns
-    -------
-    int
-        Estimated number of cars that fit along the kerb.
-    """
-    geo_wgs = gpd.GeoSeries([geometry], crs=3857).to_crs(4326).geometry[0]
-
-    lats: list[float] = []
-    if geo_wgs.geom_type == "MultiLineString":
-        for line in geo_wgs.geoms:
-            lats.extend(y for _, y in line.coords)
-    else:
-        lats.extend(y for _, y in geo_wgs.coords)
-
-    mean_lat = float(np.mean(lats))
-    length_m = float(geometry.length)
-    corrected = length_m * math.cos(math.radians(mean_lat))
-    car_count = int(round(corrected / config["AVG_CAR_LENGTH"]))
+def get_line_count(geometry):
+    """estimate street-parking capacity from a line geometry in epsg:3857"""
+    length_m = corrected_line_length(geometry)
+    car_count = int(round(length_m / config["AVG_CAR_LENGTH"]))
     return max(car_count, 0)
 
 
-def count_edges(
-    geom: Union[Polygon, LineString, Point, MultiLineString],
-    padding_pct: float = 0.10,
-    zoom: int = 19,
-) -> int:
+def count_edges(geom, padding_pct=0.10, zoom=19):
     """
     Count parking stalls for a single geometry using the CV baseline.
 
     Pipeline (for Polygons):
-
-    1. Fetch an Esri satellite tile covering the geometry.
-    2. Convert to grayscale → Gaussian blur.
-    3. Canny edge detection → Hough line detection.
-    4. If fewer than 50 lines detected, fall back to an area-based formula:
-       ``N = floor(area / stall_area * (1 - mu))``.
-       Otherwise estimate ``N = lines / 2``.
-
-    Parameters
-    ----------
-    geom : shapely geometry
-        Feature geometry in EPSG:3857.
-    padding_pct : float
-        Fraction of bbox to add as padding (default 0.10).
-    zoom : int
-        Tile zoom level (default 19).
-
-    Returns
-    -------
-    int
-        Estimated number of parking stalls.
+    1. Fetch satellite tile covering the geometry.
+    2. Convert to grayscale, gaussian blur.
+    3. Canny edge detection, hough line detection.
+    4. If fewer than 50 lines, fall back to area-based formula.
+       Otherwise estimate N = lines / 2.
     """
     logger.info("Processing geometry: %s", geom.geom_type)
 
@@ -108,23 +52,9 @@ def count_edges(
     if geom.geom_type in ("LineString", "MultiLineString"):
         return get_line_count(geom)
 
-    # Polygon / MultiPolygon path
-    minx, miny, maxx, maxy = geom.bounds
-
-    width = maxx - minx
-    height = maxy - miny
-    x_pad = width * padding_pct
-    y_pad = height * padding_pct
-
-    img_array, _ = ctx.bounds2img(
-        minx - x_pad,
-        miny - y_pad,
-        maxx + x_pad,
-        maxy + y_pad,
-        zoom=zoom,
-        ll=False,
-        source=ctx.providers.Esri.WorldImagery,
-    )
+    # polygon / multipolygon path
+    pil_img = get_satellite_tile(geom, padding_pct=padding_pct, zoom=zoom)
+    img_array = np.array(pil_img)
 
     bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -142,7 +72,7 @@ def count_edges(
         apertureSize=config["CV2"]["canny"]["aperture_size"],
     )
 
-    lines: npt.NDArray[np.int32] | None = cv2.HoughLinesP(
+    lines = cv2.HoughLinesP(
         edges,
         rho=config["CV2"]["hough_lines_p"]["rho"],
         theta=config["CV2"]["hough_lines_p"]["theta"],
@@ -162,41 +92,14 @@ def count_edges(
     return area_estimate
 
 
-def visualize_pipeline(
-    geom: Polygon,
-    padding_pct: float = 0.10,
-    zoom: int = 19,
-) -> dict[str, np.ndarray]:
+def visualize_pipeline(geom, padding_pct=0.10, zoom=19):
     """
     Run the CV pipeline and return intermediate images for educational display.
 
-    Returns a dict with keys: ``"satellite"``, ``"gray"``, ``"blur"``,
-    ``"edges"``, ``"lines"``.
-
-    Parameters
-    ----------
-    geom : Polygon
-        Feature geometry in EPSG:3857.
-    padding_pct : float
-        Fraction of bbox to add as padding.
-    zoom : int
-        Tile zoom level.
-
-    Returns
-    -------
-    dict[str, numpy.ndarray]
-        Intermediate CV images keyed by step name.
+    Returns a dict with keys: "satellite", "gray", "blur", "edges", "lines".
     """
-    minx, miny, maxx, maxy = geom.bounds
-    width = maxx - minx
-    height = maxy - miny
-    x_pad = width * padding_pct
-    y_pad = height * padding_pct
-
-    img_array, _ = ctx.bounds2img(
-        minx - x_pad, miny - y_pad, maxx + x_pad, maxy + y_pad,
-        zoom=zoom, ll=False, source=ctx.providers.Esri.WorldImagery,
-    )
+    pil_img = get_satellite_tile(geom, padding_pct=padding_pct, zoom=zoom)
+    img_array = np.array(pil_img)
 
     bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)

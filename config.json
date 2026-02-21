@@ -1,8 +1,14 @@
 {
   "DEFAULT_RADIUS": 300,
   "OSM_TAGS": {
-    "amenity": ["parking", "parking_space"],
-    "building": ["garage", "garages"],
+    "amenity": [
+      "parking",
+      "parking_space"
+    ],
+    "building": [
+      "garage",
+      "garages"
+    ],
     "parking:lane": true,
     "parking:left": true,
     "parking:right": true,
@@ -10,7 +16,10 @@
   },
   "CV2": {
     "gaussian_blur": {
-      "ksize": [5, 5],
+      "ksize": [
+        5,
+        5
+      ],
       "sigma": 1.5
     },
     "canny": {
@@ -28,5 +37,12 @@
   },
   "AVG_CAR_LENGTH": 4,
   "STALL_AREA_USA": 32.0,
-  "mu": 0.7
+  "mu": 0.7,
+  "STALL_AREA_M2": 15.5,
+  "USABLE_FRACTION_GARAGE": 0.60,
+  "USABLE_FRACTION_SURFACE": 0.50,
+  "DEFAULT_GARAGE_LEVELS": 3,
+  "DEFAULT_UNDERGROUND_LEVELS": 2,
+  "AVG_CAR_LENGTH_M": 5.5,
+  "MIN_CONFIDENCE": 0.35
 }
