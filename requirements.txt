@@ -12,9 +12,15 @@ Pillow>=10.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 
-# ML baseline (Grounding DINO)
+# ML baseline (Grounding DINO) + SegFormer fine-tuning
 torch>=2.0.0
-transformers>=4.30.0
+transformers>=4.45.0
+accelerator>=0.30.0
+datasets>=2.18.0
+evaluate>=0.4.0
+albumentations>=1.4.0
+scikit-learn>=1.4.0
+tqdm>=4.66.0
 
 # Jupyter
 jupyter>=1.0.0
