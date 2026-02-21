@@ -3,8 +3,9 @@ from ultralytics import YOLO
 
 def main():
     if not os.path.exists("data/yolo_dataset/data.yaml"):
+        import sys
         print("YOLO dataset not found. Running prepare_dataset.py...")
-        os.system("python yolo/prepare_dataset.py")
+        os.system(f"{sys.executable} yolo/prepare_dataset.py")
         print("Dataset preparation complete.")
         
     model = YOLO("yolo26n.pt")  # Using YOLO26 nano for best performance/speed

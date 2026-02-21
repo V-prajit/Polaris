@@ -3,6 +3,6 @@
 
 /data/
 /runs/
-*.pt
 .DS_Store
 scripts/__pycache__
+/cache

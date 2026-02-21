@@ -32,7 +32,7 @@ def main():
         geom = row.geometry
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             img = get_satellite_tile(geom)
-            spots = detector.count_spots(img, geom)
+            spots = detector.count_spots(img, geom, osm_tags=row.to_dict())
             counts.append(spots)
         elif geom.geom_type in ("LineString", "MultiLineString"):
             spots = get_line_count(geom)

@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from parksight import pick_device
+
 logger = logging.getLogger(__name__)
 
 # Default labels for zero-shot detection
@@ -55,17 +57,9 @@ class ParkingDetector:
         device: str | None = None,
     ) -> None:
         self.model_id = model_id
-        self.device = device or self._pick_device()
+        self.device = device or pick_device()
         self._processor = None
         self._model = None
-
-    @staticmethod
-    def _pick_device() -> str:
-        if torch.cuda.is_available():
-            return "cuda"
-        if torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
 
     def _load(self) -> None:
         """Lazy-load the model and processor."""
