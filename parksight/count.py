@@ -153,9 +153,10 @@ class GeometricResult:
     """Result of the geometric parking-design estimator."""
     count: int            # estimated number of stalls
     best_angle_deg: float # stall angle that maximised count (90 / 60 / 45 / 0)
-    layout: str           # "double-loaded", "single-loaded", "parallel"
+    layout: str           # "double-loaded", "single-loaded", "parallel", "irregular"
     lot_area_m2: float    # polygon area in m²
     gross_per_stall_m2: float  # implied gross area per stall
+    solidity: float = 1.0 # polygon area / convex hull area (compactness measure)
 
 
 def count_geometric(
@@ -211,8 +212,35 @@ def count_geometric(
 
     lot_area = geom.area  # m²
 
+    # ── Solidity check: filter out campus-zone / non-parking polygons ─────────
+    # Solidity = polygon area / convex hull area.
+    # Real parking lots are compact (0.7–1.0).
+    # Jagged campus zones wrapping buildings score 0.2–0.4.
+    # We scale effective area by solidity so irregular polygons get lower counts.
+    try:
+        convex_area = geom.convex_hull.area
+        solidity = lot_area / convex_area if convex_area > 0 else 1.0
+    except Exception:
+        solidity = 1.0
+
+    # Very non-compact: almost certainly not a real parking lot
+    if solidity < 0.25:
+        logger.warning(
+            "Polygon solidity=%.2f < 0.25 — likely a campus zone, not a parking lot. "
+            "Returning 0.", solidity
+        )
+        return GeometricResult(
+            count=0, best_angle_deg=0.0, layout="irregular",
+            lot_area_m2=lot_area, gross_per_stall_m2=float("inf"),
+            solidity=solidity,
+        )
+
+    # Scale the effective area by solidity (irregular areas contain less usable pavement)
+    effective_area = lot_area * solidity
+
+
     # ── read OSM orientation hint ─────────────────────────────────────────────
-    orientation = (
+    orientation = str(
         tags.get("parking:orientation")
         or tags.get("orientation")
         or tags.get("parking")
@@ -273,7 +301,14 @@ def count_geometric(
             best_angle = angle
             best_gross = gross
 
-    final = max(0, int(best_count * efficiency))
+    # ── Cap by effective polygon area (solidity-adjusted) ────────────────────
+    # OBB can be much larger than the actual polygon for irregular lots.
+    # Physical upper bound: 1 stall per (stall_w × stall_d) = 14.3 m² minimum.
+    # We use effective_area (= lot_area × solidity) so jagged campus zones
+    # can't inflate the count beyond what their usable footprint supports.
+    min_m2_per_stall = stall_w * stall_d  # 14.3 m²
+    area_cap = int((effective_area / min_m2_per_stall) * efficiency)
+    final = min(max(0, int(best_count * efficiency)), area_cap)
 
     return GeometricResult(
         count=final,
@@ -281,5 +316,6 @@ def count_geometric(
         layout="double-loaded",
         lot_area_m2=lot_area,
         gross_per_stall_m2=best_gross,
+        solidity=solidity,
     )
 

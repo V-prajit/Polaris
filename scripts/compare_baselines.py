@@ -24,6 +24,43 @@ from parksight.count import count_edges, get_line_count
 from parksight.estimate_structured import estimate_structured_parking, estimate_street_parking
 
 
+def run_geometric_baseline(gdf_3857):
+    """Tier 0: ITE/NPA design-standards estimator using OSM polygon geometry."""
+    from parksight.count import count_geometric
+    from shapely.ops import unary_union
+
+    # Deduplicate: drop any polygon that overlaps >60% with a larger one
+    geoms = list(gdf_3857.geometry)
+    areas = [g.area for g in geoms]
+    keep  = [True] * len(geoms)
+    for i, gi in enumerate(geoms):
+        if not keep[i]:
+            continue
+        for j, gj in enumerate(geoms):
+            if i == j or not keep[j] or areas[j] <= areas[i]:
+                continue
+            try:
+                if gi.intersection(gj).area / gi.area > 0.60:
+                    keep[i] = False
+                    break
+            except Exception:
+                pass
+
+    total = 0
+    for idx, (_, row) in enumerate(gdf_3857.iterrows()):
+        if not keep[idx]:
+            continue
+        geom = row.geometry
+        if geom.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
+        try:
+            result = count_geometric(geom, osm_tags=row.to_dict())
+            total += result.count
+        except Exception as e:
+            print(f"  Geometric skip: {e}")
+    return total
+
+
 def run_cv_baseline(gdf_3857):
     # tier 1: canny edge detection + hough lines
     counts = []
@@ -39,7 +76,8 @@ def run_cv_baseline(gdf_3857):
 
 
 def run_ml_baseline(gdf_3857):
-    # tier 2: grounding dino zero-shot
+    # tier 2: grounding dino zero-shot via parksight.detect.ParkingDetector
+    # Note: ml_baseline.py was removed; use --skip-ml to bypass this tier.
     from parksight.detect import ParkingDetector
     detector = ParkingDetector()
 
@@ -141,6 +179,14 @@ def main():
     gdf_3857 = gdf.to_crs(epsg=3857)
 
     results = {}
+
+    # --- tier 0: geometric baseline ---
+    print("[0] Running Geometric Baseline (ITE/NPA design standards)...")
+    t0 = time.time()
+    geo_total = run_geometric_baseline(gdf_3857)
+    geo_time = time.time() - t0
+    results["Geometric (design std)"] = {"total": geo_total, "time": geo_time}
+    print(f"    Total: {geo_total} spots | Time: {geo_time:.1f}s\n")
 
     # --- tier 1: cv baseline ---
     print("[1/4] Running CV Baseline (Canny + Hough)...")
