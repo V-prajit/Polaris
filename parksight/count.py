@@ -18,7 +18,10 @@ import logging
 import cv2
 import numpy as np
 import numpy.typing as npt
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+import math
+import json
+from typing import Union
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 from parksight import config, corrected_line_length
 from parksight.fetch import get_satellite_tile
@@ -136,3 +139,147 @@ def visualize_pipeline(geom, padding_pct=0.10, zoom=19):
         "edges": edges,
         "lines": line_img,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometric / design-standards estimator
+# ─────────────────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+
+
+@dataclass
+class GeometricResult:
+    """Result of the geometric parking-design estimator."""
+    count: int            # estimated number of stalls
+    best_angle_deg: float # stall angle that maximised count (90 / 60 / 45 / 0)
+    layout: str           # "double-loaded", "single-loaded", "parallel"
+    lot_area_m2: float    # polygon area in m²
+    gross_per_stall_m2: float  # implied gross area per stall
+
+
+def count_geometric(
+    geom: Union[Polygon, "MultiPolygon"],
+    osm_tags: dict | None = None,
+    stall_w: float = 2.6,
+    stall_d: float = 5.5,
+    aisle_w: float = 7.3,
+    efficiency: float = 0.85,
+) -> GeometricResult:
+    """
+    Estimate parking spots by reverse-engineering standard lot design (ITE/NPA).
+
+    Algorithm
+    ---------
+    1. Compute the lot's **minimum oriented bounding rectangle** (tightest OBB,
+       not axis-aligned), giving ``short_side`` and ``long_side`` in metres.
+    2. For each candidate stall angle (90°, 60°, 45°):
+       - Double-loaded module width = 2 × stall_depth + aisle_width = 18.3 m (90°)
+       - Modules across short side → 2 rows per module (+ possible edge row)
+       - Stalls per row along long side = long_side / stall_pitch
+       - raw_count = n_rows × stalls_per_row
+    3. Pick the angle that maximises raw_count.
+    4. Apply ``efficiency`` factor (dead corners, disabled bays, cart corrals).
+    5. Respect ``parking:orientation`` OSM tag if present.
+
+    Parameters
+    ----------
+    geom : Polygon | MultiPolygon
+        Parking lot in **EPSG:3857** (metres).
+    osm_tags : dict or None
+        Raw OSM feature tags.
+    stall_w : float
+        Stall width [m] — US standard 2.6 m (8.5 ft).
+    stall_d : float
+        Stall depth [m] — US standard 5.5 m (18 ft).
+    aisle_w : float
+        Two-way drive-aisle width [m] — 7.3 m (24 ft) for 90°.
+    efficiency : float
+        Fraction of theoretical capacity that is usable (default 0.85).
+
+    Returns
+    -------
+    GeometricResult
+    """
+    from shapely.ops import unary_union as _uu
+
+    tags = osm_tags or {}
+
+    # ── merge multi-polygons ──────────────────────────────────────────────────
+    if geom.geom_type == "MultiPolygon":
+        geom = _uu(geom)
+
+    lot_area = geom.area  # m²
+
+    # ── read OSM orientation hint ─────────────────────────────────────────────
+    orientation = (
+        tags.get("parking:orientation")
+        or tags.get("orientation")
+        or tags.get("parking")
+        or ""
+    ).lower()
+
+    # Parallel parking: car fits lengthwise, one row per ~car-width strip
+    if orientation in ("parallel", "street_side", "on_street"):
+        gross = stall_w * stall_d   # 2.6 × 5.5 ≈ 14.3 m²
+        count = max(0, int((lot_area / gross) * efficiency))
+        return GeometricResult(
+            count=count, best_angle_deg=0.0, layout="parallel",
+            lot_area_m2=lot_area, gross_per_stall_m2=gross,
+        )
+
+    # Limit angle search if OSM gives a hint
+    if orientation in ("diagonal", "angled"):
+        candidate_angles = [60.0, 45.0]
+    else:
+        candidate_angles = [90.0, 60.0, 45.0]
+
+    # ── minimum oriented bounding rectangle ──────────────────────────────────
+    mbr = geom.minimum_rotated_rectangle
+    coords = list(mbr.exterior.coords)[:4]
+    sides = sorted(
+        np.linalg.norm(np.array(coords[i + 1]) - np.array(coords[i]))
+        for i in range(3)
+    )
+    mbr_short, mbr_long = sides[0], sides[1]
+
+    best_count = 0
+    best_angle = 90.0
+    best_gross = lot_area  # fallback: 1 stall
+
+    for angle in candidate_angles:
+        rad = math.radians(angle)
+
+        # Stall pitch along the row (widens for angled stalls)
+        eff_pitch = stall_w if angle == 90.0 else stall_w / math.sin(rad)
+
+        # Double-loaded module depth across the short axis
+        module_w = 2.0 * stall_d + aisle_w          # e.g. 18.3 m at 90°
+
+        n_modules = int(mbr_short / module_w)
+        n_rows = n_modules * 2
+
+        # One extra single-loaded row if space allows
+        remaining = mbr_short - n_modules * module_w
+        if remaining >= stall_d + aisle_w / 2:
+            n_rows += 1
+
+        stalls_per_row = max(0, int(mbr_long / eff_pitch))
+        raw = n_rows * stalls_per_row
+        gross = lot_area / raw if raw > 0 else float("inf")
+
+        if raw > best_count:
+            best_count = raw
+            best_angle = angle
+            best_gross = gross
+
+    final = max(0, int(best_count * efficiency))
+
+    return GeometricResult(
+        count=final,
+        best_angle_deg=best_angle,
+        layout="double-loaded",
+        lot_area_m2=lot_area,
+        gross_per_stall_m2=best_gross,
+    )
+
