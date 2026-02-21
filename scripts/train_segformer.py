@@ -36,20 +36,140 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import PolynomialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
+from torchvision import transforms as T
 
 # ── Make sure repo is on PYTHONPATH ────────────────────────────────────────────
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from parksight.data import ParkSegDataset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YOLO-layout dataset (train/images + train/labels)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class YoloSegDataset(Dataset):
+    """
+    Reads a pre-split YOLO dataset layout::
+
+        data_dir/
+          train/images/*.jpg
+          train/labels/*.txt   ← YOLO bbox format (class cx cy w h, normalised)
+          val/images/*.jpg
+          val/labels/*.txt
+
+    Each sample returns:
+        ``pixel_values`` : float32 tensor [3, img_size, img_size]  (ImageNet-normed)
+        ``labels``       : int64  tensor [img_size, img_size]       (0=bg, 1=stall)
+    """
+
+    _MEAN = (0.485, 0.456, 0.406)
+    _STD  = (0.229, 0.224, 0.225)
+
+    def __init__(
+        self,
+        data_dir: Path,
+        split: str,          # "train" or "val"
+        img_size: int = 512,
+        augment: bool = True,
+    ) -> None:
+        self.img_size = img_size
+        self.augment  = augment and (split == "train")
+
+        img_dir   = data_dir / split / "images"
+        label_dir = data_dir / split / "labels"
+
+        if not img_dir.is_dir():
+            raise FileNotFoundError(f"Expected {img_dir}")
+        if not label_dir.is_dir():
+            raise FileNotFoundError(f"Expected {label_dir}")
+
+        exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+        self.pairs: List[Tuple[Path, Path]] = []
+        for img_p in sorted(img_dir.iterdir()):
+            if img_p.suffix.lower() not in exts:
+                continue
+            lbl_p = label_dir / (img_p.stem + ".txt")
+            if lbl_p.exists():
+                self.pairs.append((img_p, lbl_p))
+
+        if not self.pairs:
+            raise ValueError(f"No (image, label) pairs found under {data_dir}/{split}/")
+
+        logger.info("YoloSegDataset [%s]: %d pairs", split, len(self.pairs))
+
+        # Shared normalisation transform
+        self._to_tensor = T.Compose([
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),
+            T.Normalize(mean=self._MEAN, std=self._STD),
+        ])
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _bbox_to_mask(self, label_path: Path, img_w: int, img_h: int) -> np.ndarray:
+        """Render YOLO bboxes into a binary numpy mask (uint8, 0/1)."""
+        mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        try:
+            lines = label_path.read_text().splitlines()
+        except Exception:
+            return mask
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) != 5:
+                continue
+            _, cx, cy, bw, bh = map(float, parts)
+            x1 = int((cx - bw / 2) * img_w)
+            y1 = int((cy - bh / 2) * img_h)
+            x2 = int((cx + bw / 2) * img_w)
+            y2 = int((cy + bh / 2) * img_h)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img_w - 1, x2), min(img_h - 1, y2)
+            mask[y1:y2, x1:x2] = 1
+        return mask
+
+    # ── Dataset interface ────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        img_path, lbl_path = self.pairs[idx]
+
+        image = Image.open(img_path).convert("RGB")
+        img_w, img_h = image.size
+
+        # Build binary mask from YOLO bboxes
+        mask_np = self._bbox_to_mask(lbl_path, img_w, img_h)
+        mask_img = Image.fromarray(mask_np * 255)  # 0 or 255
+
+        # Optional random horizontal flip
+        if self.augment and torch.rand(1).item() > 0.5:
+            image    = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Resize image and mask to img_size
+        pixel_values = self._to_tensor(image)  # [3, H, W]
+
+        mask_resized = mask_img.resize(
+            (self.img_size, self.img_size), resample=Image.NEAREST
+        )
+        labels = torch.from_numpy(
+            (np.array(mask_resized) > 127).astype(np.int64)
+        )  # [H, W], values 0/1
+
+        return {"pixel_values": pixel_values, "labels": labels}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -236,14 +356,24 @@ def main() -> None:
     np.random.seed(args.seed + rank)
 
     # ── DataLoaders ────────────────────────────────────────────────────
-    stall_ids = set(args.stall_class_ids)
-    train_ds, val_ds = ParkSegDataset.make_splits(
-        args.data_dir,
-        val_split=args.val_split,
-        seed=args.seed,
-        stall_class_ids=stall_ids,
-        img_size=args.img_size,
-    )
+    # Auto-detect YOLO pre-split layout (data_dir/train/images exists)
+    yolo_train_dir = args.data_dir / "train" / "images"
+    if yolo_train_dir.is_dir():
+        if is_main:
+            logger.info("Detected YOLO pre-split layout — using YoloSegDataset")
+        train_ds = YoloSegDataset(args.data_dir, split="train", img_size=args.img_size, augment=True)
+        val_ds   = YoloSegDataset(args.data_dir, split="val",   img_size=args.img_size, augment=False)
+    else:
+        if is_main:
+            logger.info("Using ParkSegDataset (images/ + masks/ layout)")
+        stall_ids = set(args.stall_class_ids)
+        train_ds, val_ds = ParkSegDataset.make_splits(
+            args.data_dir,
+            val_split=args.val_split,
+            seed=args.seed,
+            stall_class_ids=stall_ids,
+            img_size=args.img_size,
+        )
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None

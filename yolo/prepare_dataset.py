@@ -79,7 +79,7 @@ def process_apklot():
 
 def process_parkseg():
     print("Loading ParkSeg12k from HuggingFace...")
-    ds = datasets.load_dataset('UTEL-UIUC/parkseg12k')
+    ds = datasets.load_dataset('UTEL-UIUC/parkseg12k', streaming=True)
     
     samples = []
     
