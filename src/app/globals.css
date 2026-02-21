@@ -1,35 +1,44 @@
 @import "tailwindcss";
 
 :root {
-  --background: 0 0% 100%;
-  --foreground: 222.2 84% 4.9%;
+  /* Dark navy theme — GrowthFactor.ai inspired */
+  --background: 222 47% 6%;
+  --foreground: 210 40% 96%;
 
-  --card: 0 0% 100%;
-  --card-foreground: 222.2 84% 4.9%;
+  --card: 222 40% 10%;
+  --card-foreground: 210 40% 96%;
 
-  --popover: 0 0% 100%;
-  --popover-foreground: 222.2 84% 4.9%;
+  --popover: 222 40% 10%;
+  --popover-foreground: 210 40% 96%;
 
-  --primary: 222.2 47.4% 11.2%;
-  --primary-foreground: 210 40% 98%;
+  --primary: 187 73% 46%;
+  --primary-foreground: 222 47% 6%;
 
-  --secondary: 210 40% 96.1%;
-  --secondary-foreground: 222.2 47.4% 11.2%;
+  --secondary: 215 25% 18%;
+  --secondary-foreground: 210 40% 90%;
 
-  --muted: 210 40% 96.1%;
-  --muted-foreground: 215.4 16.3% 46.9%;
+  --muted: 215 25% 15%;
+  --muted-foreground: 215 16% 56%;
 
-  --accent: 210 40% 96.1%;
-  --accent-foreground: 222.2 47.4% 11.2%;
+  --accent: 187 73% 46%;
+  --accent-foreground: 222 47% 6%;
 
-  --destructive: 0 84.2% 60.2%;
+  --destructive: 0 84% 60%;
   --destructive-foreground: 210 40% 98%;
 
-  --border: 214.3 31.8% 91.4%;
-  --input: 214.3 31.8% 91.4%;
-  --ring: 222.2 84% 4.9%;
+  --border: 215 25% 18%;
+  --input: 215 25% 18%;
+  --ring: 187 73% 46%;
 
-  --radius: 0.5rem;
+  --radius: 0.75rem;
+
+  /* Accent colors */
+  --cyan: 187 73% 46%;
+  --cyan-glow: 187 73% 46%;
+  --blue: 213 74% 47%;
+  --success: 142 71% 45%;
+  --warning: 38 92% 50%;
+  --danger: 0 84% 60%;
 }
 
 @theme inline {
@@ -72,6 +81,105 @@
   body {
     background-color: hsl(var(--background));
     color: hsl(var(--foreground));
-    font-family: Arial, Helvetica, sans-serif;
+    font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
   }
+}
+
+/* === Glass Morphism Utility === */
+.glass-panel {
+  background: hsla(222, 40%, 10%, 0.75);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border: 1px solid hsla(215, 25%, 25%, 0.6);
+}
+
+.glass-panel-strong {
+  background: hsla(222, 40%, 8%, 0.88);
+  backdrop-filter: blur(30px) saturate(1.6);
+  -webkit-backdrop-filter: blur(30px) saturate(1.6);
+  border: 1px solid hsla(215, 25%, 25%, 0.5);
+}
+
+/* === Glow Effects === */
+@keyframes pulse-glow {
+  0%, 100% { filter: drop-shadow(0 0 6px hsla(187, 73%, 46%, 0.4)); }
+  50% { filter: drop-shadow(0 0 16px hsla(187, 73%, 46%, 0.7)); }
+}
+
+@keyframes pulse-ring {
+  0% { stroke-dashoffset: 1000; opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { stroke-dashoffset: 0; opacity: 0.6; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer-bg {
+  background: linear-gradient(
+    90deg,
+    hsla(215, 25%, 18%, 0) 0%,
+    hsla(187, 73%, 46%, 0.08) 50%,
+    hsla(215, 25%, 18%, 0) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 3s ease-in-out infinite;
+}
+
+/* === Custom Scrollbar === */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: hsla(215, 25%, 30%, 0.5);
+  border-radius: 10px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: hsla(187, 73%, 46%, 0.4);
+}
+
+/* === Leaflet Custom Tooltips === */
+.parking-tooltip {
+  background: hsla(222, 40%, 8%, 0.92) !important;
+  backdrop-filter: blur(12px) !important;
+  border: 1px solid hsla(187, 73%, 46%, 0.3) !important;
+  border-radius: 12px !important;
+  padding: 12px 16px !important;
+  color: hsl(210, 40%, 96%) !important;
+  font-family: var(--font-sans), system-ui, sans-serif !important;
+  font-size: 13px !important;
+  box-shadow: 0 8px 32px hsla(0, 0%, 0%, 0.4), 0 0 16px hsla(187, 73%, 46%, 0.15) !important;
+  max-width: 280px !important;
+}
+.parking-tooltip .leaflet-tooltip-arrow {
+  display: none !important;
+}
+.parking-tooltip .tooltip-title {
+  font-weight: 700;
+  font-size: 14px;
+  color: hsl(187, 73%, 60%);
+  margin-bottom: 6px;
+}
+.parking-tooltip .tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 3px 0;
+  gap: 16px;
+}
+.parking-tooltip .tooltip-label {
+  color: hsla(210, 40%, 96%, 0.5);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.parking-tooltip .tooltip-value {
+  font-weight: 600;
+  color: hsl(210, 40%, 96%);
+  font-size: 13px;
 }
