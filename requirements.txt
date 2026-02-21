@@ -24,3 +24,6 @@ tqdm>=4.66.0
 
 # Jupyter
 jupyter>=1.0.0
+
+# YOLO
+ultralytics>=8.0.0
