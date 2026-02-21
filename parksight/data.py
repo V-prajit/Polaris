@@ -313,7 +313,8 @@ class ParkSegDataset:
             img_np = np.array(image)
             transformed = self.transform(image=img_np, mask=binary_mask)
             pixel_values = transformed["image"]  # Tensor[3, H, W]
-            labels = torch.from_numpy(transformed["mask"]).long()
+            mask_out = transformed["mask"]
+            labels = mask_out.long() if isinstance(mask_out, torch.Tensor) else torch.from_numpy(mask_out).long()
         elif _TORCHVISION_AVAILABLE and self.transform is not None:
             # torchvision path — apply spatial augmentations manually to keep
             # image and mask in sync, then apply the rest of the transform.
