@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { Globe } from "@/components/ui/globe";
-import { Progress } from "@/components/ui/progress";
+import { Progress, ProgressIndicator } from "@/components/animate-ui/primitives/radix/progress";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
@@ -117,14 +117,15 @@ export default function Home() {
             className="absolute bottom-10 right-10 z-30 w-60 space-y-4"
           >
             <div className="space-y-2">
-              <div className="flex justify-between text-sm font-medium text-muted-foreground">
-                <span>Processing imagery...</span>
-                <span>{Math.round(progress)}%</span>
-              </div>
-              <Progress value={progress} className="h-2" />
+              <p className="text-sm font-medium text-muted-foreground">
+                Getting you the most accurate estimate...
+              </p>
+              <Progress value={progress} className="w-full h-2 border overflow-hidden">
+                <ProgressIndicator className="size-full flex-1 bg-primary" />
+              </Progress>
             </div>
             <p className="text-xs text-muted-foreground text-center animate-pulse">
-              Running SegFormer-B4 segmentation
+              Powered by GrowthFactor
             </p>
           </motion.div>
         )}
