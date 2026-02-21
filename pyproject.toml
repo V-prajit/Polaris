@@ -1,0 +1,21 @@
+[project]
+name = "parksight-starter-kit"
+version = "0.1.0"
+description = "Satellite parking space counting toolkit for Hacklytics 2026"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "osmnx>=2.0.0",
+    "geopandas>=1.0.0",
+    "shapely>=2.0.0",
+    "contextily>=1.6.0",
+    "folium>=0.19.0",
+    "pyproj>=3.7.0",
+    "opencv-python-headless>=4.8.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "jupyter>=1.0.0",
+]

@@ -1,0 +1,20 @@
+# Core geospatial
+osmnx>=2.0.0
+geopandas>=1.0.0
+shapely>=2.0.0
+contextily>=1.6.0
+folium>=0.19.0
+pyproj>=3.7.0
+
+# Image processing
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# ML baseline (Grounding DINO)
+torch>=2.0.0
+transformers>=4.30.0
+
+# Jupyter
+jupyter>=1.0.0

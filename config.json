@@ -1,0 +1,32 @@
+{
+  "DEFAULT_RADIUS": 300,
+  "OSM_TAGS": {
+    "amenity": ["parking", "parking_space"],
+    "building": ["garage", "garages"],
+    "parking:lane": true,
+    "parking:left": true,
+    "parking:right": true,
+    "parking:both": true
+  },
+  "CV2": {
+    "gaussian_blur": {
+      "ksize": [5, 5],
+      "sigma": 1.5
+    },
+    "canny": {
+      "threshold1": 50,
+      "threshold2": 150,
+      "aperture_size": 3
+    },
+    "hough_lines_p": {
+      "rho": 1,
+      "theta": 0.0174533,
+      "threshold": 100,
+      "min_line_length": 50,
+      "max_line_gap": 10
+    }
+  },
+  "AVG_CAR_LENGTH": 4,
+  "STALL_AREA_USA": 32.0,
+  "mu": 0.7
+}
