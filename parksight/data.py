@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ── Class remapping ────────────────────────────────────────────────────────────
 # ParkSeg12k class IDs that correspond to parking stall markings.
 # Adjust if the dataset uses different indices.
-STALL_CLASS_IDS: set[int] = {1, 2, 3}  # 1=stall_marking, 2=stall_box, 3=stripe
+STALL_CLASS_IDS: set[int] = {255}  # ParkSeg12k uses 0=bg, 255=parking
 
 # Image size fed to SegFormer
 IMG_SIZE: int = 512
