@@ -108,7 +108,7 @@ def _get_albu_transforms(split: str, img_size: int) -> "A.Compose":
             [
                 A.RandomResizedCrop(
                     size=(img_size, img_size),
-                    scale=(0.5, 1.0),
+                    scale=(0.7, 1.0),
                     ratio=(0.75, 1.333),
                 ),
                 A.HorizontalFlip(p=0.5),
@@ -138,13 +138,15 @@ def _get_albu_transforms(split: str, img_size: int) -> "A.Compose":
 
 
 def _get_torchvision_transforms(split: str, img_size: int) -> T.Compose:
-    """Minimal torchvision pipeline (image only — masks handled separately)."""
+    """Minimal torchvision pipeline (image only — spatial augmentations are
+    handled in __getitem__ to keep image/mask in sync)."""
     normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     if split == "train":
         return T.Compose(
             [
                 T.Resize((img_size, img_size)),
-                T.RandomHorizontalFlip(),
+                # NOTE: RandomHorizontalFlip removed — applied manually in
+                # __getitem__ so the mask can be flipped in sync.
                 T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
                 T.ToTensor(),
                 normalize,
@@ -313,8 +315,15 @@ class ParkSegDataset:
             pixel_values = transformed["image"]  # Tensor[3, H, W]
             labels = torch.from_numpy(transformed["mask"]).long()
         elif _TORCHVISION_AVAILABLE and self.transform is not None:
-            # torchvision path (image only — resize mask manually)
+            # torchvision path — apply spatial augmentations manually to keep
+            # image and mask in sync, then apply the rest of the transform.
+            import random as _rand
             import torchvision.transforms.functional as TF
+
+            # Synchronized random horizontal flip
+            if self.split == "train" and _rand.random() > 0.5:
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                binary_mask = np.fliplr(binary_mask).copy()
 
             pixel_values = self.transform(image)  # Tensor[3, H, W]
             mask_pil = Image.fromarray(binary_mask).resize(

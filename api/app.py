@@ -51,21 +51,45 @@ app.add_middleware(
 )
 
 
-# lazy-loaded yolo detector singleton
+# lazy-loaded model singletons
 _detector = None
+_segmenter = None
 
 def _get_detector():
     global _detector
     if _detector is None:
-        weights = PROJECT_ROOT / "models" / "yolo26n_run1.pt"
-        if not weights.exists():
-            logger.warning("YOLO weights not found at %s, surface detection disabled", weights)
+        # Prefer APKLOT-trained model, fall back to ParkSeg-trained
+        apklot_weights = PROJECT_ROOT / "models" / "yolo_apklot_best.pt"
+        parkseg_weights = PROJECT_ROOT / "models" / "yolo26n_run1.pt"
+        if apklot_weights.exists():
+            from yolo.detect import YOLOParkingDetector
+            logger.info("Loading APKLOT YOLO model from %s ...", apklot_weights)
+            _detector = YOLOParkingDetector(str(apklot_weights), count_mode="detect")
+        elif parkseg_weights.exists():
+            from yolo.detect import YOLOParkingDetector
+            logger.info("Loading ParkSeg YOLO model from %s ...", parkseg_weights)
+            _detector = YOLOParkingDetector(str(parkseg_weights), count_mode="area")
+        else:
+            logger.warning("No YOLO weights found, surface detection disabled")
             return None
-        from yolo.detect import YOLOParkingDetector
-        logger.info("Loading YOLO model from %s ...", weights)
-        _detector = YOLOParkingDetector(str(weights))
-        logger.info("YOLO model loaded.")
+        logger.info("YOLO model loaded (count_mode=%s).", _detector.count_mode)
     return _detector
+
+
+def _get_segmenter():
+    global _segmenter
+    if _segmenter is None:
+        ckpt = PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model"
+        if not ckpt.exists():
+            ckpt = PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model"
+        if not ckpt.exists():
+            logger.info("No SegFormer checkpoint found, skipping segmentation stage.")
+            return None
+        from parksight.segment import ParkingSegmenter
+        logger.info("Loading SegFormer from %s ...", ckpt)
+        _segmenter = ParkingSegmenter(str(ckpt))
+        logger.info("SegFormer loaded.")
+    return _segmenter
 
 
 def _geometry_to_coords(geom):
@@ -106,8 +130,9 @@ def _sanitize_dict(d):
 
 
 def _run_surface_detection(gdf_3857):
-    """run yolo on surface lots, return list of per-feature dicts"""
+    """Run two-stage pipeline on surface lots: SegFormer mask → YOLO detect."""
     detector = _get_detector()
+    segmenter = _get_segmenter()
     results = []
 
     for idx, row in gdf_3857.iterrows():
@@ -121,11 +146,27 @@ def _run_surface_detection(gdf_3857):
 
         count = 0
         if geom.geom_type in ("Polygon", "MultiPolygon"):
+            img = get_satellite_tile(geom)
+
+            # Stage 1: SegFormer lot mask (optional)
+            seg_mask = None
+            if segmenter is not None:
+                try:
+                    seg_mask = segmenter.segment(img)
+                except Exception as e:
+                    logger.warning("SegFormer failed for feature %s: %s", idx, e)
+
+            # Stage 2: YOLO detection (with optional mask filtering)
             if detector is not None:
-                img = get_satellite_tile(geom)
-                count = detector.count_spots(img, geom, osm_tags=tags)
+                count = detector.count_spots(
+                    img, geom, osm_tags=tags, segformer_mask=seg_mask
+                )
+            elif seg_mask is not None:
+                # SegFormer-only fallback: area-based count from mask
+                result = segmenter.count_spots(img)
+                count = result.count
             else:
-                # fallback area estimate when no model
+                # No models — pure area heuristic
                 from parksight import config
                 stall_area = config["STALL_AREA_M2"]
                 usable = config["USABLE_FRACTION_SURFACE"]

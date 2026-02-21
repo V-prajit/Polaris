@@ -6,11 +6,47 @@ from PIL import Image, ImageDraw
 from parksight import config, pick_device, is_structure
 
 
+def mask_to_bboxes(mask: "np.ndarray", min_area: int = 500) -> list:
+    """Extract bounding boxes from a binary segmentation mask.
+
+    Returns list of (x1, y1, x2, y2) pixel-space boxes for regions
+    larger than *min_area* pixels.
+    """
+    import cv2
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype("uint8"), connectivity=8
+    )
+    bboxes = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        bboxes.append((x, y, x + w, y + h))
+    return bboxes
+
+
 class YOLOParkingDetector:
-    def __init__(self, weights_path, device=None):
+    def __init__(self, weights_path, device=None, count_mode="auto"):
+        """
+        Parameters
+        ----------
+        weights_path : str
+            Path to YOLO .pt weights.
+        device : str or None
+            Torch device.
+        count_mode : str
+            ``"detect"`` — count = number of detections (APKLOT-trained).
+            ``"area"``   — count = detected-region area / stall area (ParkSeg-trained).
+            ``"auto"``   — detect if >=10 boxes, else area.
+        """
         self.device = device or pick_device()
         self.model = YOLO(weights_path)
         self.model.to(self.device)
+        self.count_mode = count_mode
 
     def detect(self, pil_image, confidence=None):
         conf = confidence if confidence is not None else config["MIN_CONFIDENCE"]
@@ -26,7 +62,20 @@ class YOLOParkingDetector:
 
         return detections
 
-    def count_spots(self, pil_image, geometry, osm_tags=None):
+    def count_spots(self, pil_image, geometry, osm_tags=None, segformer_mask=None):
+        """Count parking spots in an image tile.
+
+        Parameters
+        ----------
+        pil_image : PIL.Image
+            Satellite tile covering *geometry*.
+        geometry : shapely geometry
+            OSM geometry in EPSG:3857.
+        osm_tags : dict or None
+            OSM tags for the feature.
+        segformer_mask : np.ndarray or None
+            If provided, YOLO detections outside the mask are discarded.
+        """
         tags = osm_tags or {}
         stall_area = config["STALL_AREA_M2"]
         usable_fraction = config["USABLE_FRACTION_SURFACE"]
@@ -55,7 +104,37 @@ class YOLOParkingDetector:
             area_est = int((geometry.area / stall_area) * usable_fraction)
             return area_est * floor_multiplier
 
-        # convert pixel coords to real-world metres using the geometry bounds
+        # Decide counting strategy
+        mode = self.count_mode
+        if mode == "auto":
+            mode = "detect" if len(detections) >= 10 else "area"
+
+        # ── Detection-count mode (APKLOT-trained: each box ≈ 1 spot) ──
+        if mode == "detect":
+            count = 0
+            img_w, img_h = pil_image.size
+            for bbox_px, conf, _ in detections:
+                if segformer_mask is not None:
+                    cx = int((bbox_px[0] + bbox_px[2]) / 2)
+                    cy = int((bbox_px[1] + bbox_px[3]) / 2)
+                    cx = min(max(cx, 0), img_w - 1)
+                    cy = min(max(cy, 0), img_h - 1)
+                    # mask may be different resolution than image
+                    mh, mw = segformer_mask.shape[:2]
+                    mx = int(cx * mw / img_w)
+                    my = int(cy * mh / img_h)
+                    mx = min(max(mx, 0), mw - 1)
+                    my = min(max(my, 0), mh - 1)
+                    if segformer_mask[my, mx] == 0:
+                        continue  # detection outside parking mask
+                count += 1
+            count *= floor_multiplier
+            if count == 0 and is_struct:
+                area_est = int((geometry.area / stall_area) * usable_fraction)
+                return area_est * floor_multiplier
+            return count
+
+        # ── Area-count mode (ParkSeg-trained: boxes are regions) ──
         minx, miny, maxx, maxy = geometry.bounds
         tile_width_m = maxx - minx
         tile_height_m = maxy - miny
