@@ -52,6 +52,21 @@ def _load_yolo_spot_detector():
     return None, None
 
 
+def _load_ml_detector():
+    """Load Grounding DINO zero-shot detector (ML Baseline)."""
+    from parksight.detect import ParkingDetector
+    return ParkingDetector()
+
+
+def _load_segmenter():
+    """Load SegFormer-b5 semantic segmenter."""
+    from parksight.segment import ParkingSegmenter
+    ckpt = ROOT / "models" / "best_model"
+    if ckpt.exists():
+        return ParkingSegmenter(str(ckpt))
+    return None
+
+
 def _load_yolo_car_detector():
     """Load the COCO-pretrained YOLO for car counting."""
     from yolo.detect import YOLOParkingDetector
@@ -75,6 +90,13 @@ def main():
 
     car_detector = _load_yolo_car_detector()
     print(f"  Car detector:  COCO yolo11n loaded")
+
+    ml_detector = _load_ml_detector()
+    print(f"  ML baseline:   Grounding DINO loaded")
+
+    segmenter = _load_segmenter()
+    if segmenter:
+        print(f"  Segmenter:     ParkSeg loaded")
 
     stall_area = config["STALL_AREA_M2"]
     usable = config["USABLE_FRACTION_SURFACE"]
@@ -150,13 +172,36 @@ def main():
                 except Exception as e:
                     yolo_spots = -1
 
-            # ── Method 5: YOLO car count (SAHI sliced inference) ─────
+            # ── Method 5: ML Baseline (Grounding DINO) ──────────────────
+            ml_spots = -1
+            if ml_detector is not None:
+                try:
+                    ml_spots = ml_detector.count_spots(img)
+                except Exception as e:
+                    ml_spots = -1
+
+            # ── Method 6: SegFormer segmentation ────────────────────────
+            segformer_spots = -1
+            if segmenter is not None:
+                try:
+                    segformer_spots = segmenter.count_spots(img).count
+                except Exception as e:
+                    segformer_spots = -1
+
+            # ── Method 7: YOLO car count (SAHI sliced inference) ─────
             yolo_cars = -1
             try:
                 yolo_cars = car_detector.count_cars(img, confidence=0.15)
             except Exception as e:
                 print(f"    Car count error: {e}")
                 yolo_cars = -1
+
+            # ── Method 8: Ensemble Average ──────────────────────────────
+            valid_est = []
+            for count in (area_est, yolo_spots, segformer_spots):
+                if count >= 0:
+                    valid_est.append(count)
+            ensemble_est = int(round(sum(valid_est) / len(valid_est))) if valid_est else -1
 
             # confidence bands
             area_band = confidence_band(area_est, method="area")
@@ -169,8 +214,11 @@ def main():
                 "area_m2": round(area_m2),
                 "area_est": area_est,
                 "edge_est": edge_est if edge_est >= 0 else "err",
+                "ml_est": ml_spots if ml_spots >= 0 else "err",
                 "geometric": geo_est if geo_est >= 0 else "err",
                 "yolo_spots": yolo_spots if yolo_spots >= 0 else "err",
+                "segformer": segformer_spots if segformer_spots >= 0 else "err",
+                "ensemble": ensemble_est if ensemble_est >= 0 else "err",
                 "yolo_cars": yolo_cars if yolo_cars >= 0 else "err",
             }
             all_rows.append(row_data)
@@ -182,6 +230,8 @@ def main():
                 print(f"    Geometric:       {geo_est:>5}  [{geo_band.low}-{geo_band.high}]")
             if yolo_spots >= 0:
                 print(f"    YOLO spots:      {yolo_spots:>5}")
+            if ensemble_est >= 0:
+                print(f"    Ensemble (Best): {ensemble_est:>5}")
             print(f"    YOLO cars SAHI:  {yolo_cars if yolo_cars >= 0 else 'err':>5}  {'['+str(car_band.low)+'-'+str(car_band.high)+']' if car_band else ''}")
 
     # ── Summary table ────────────────────────────────────────────────────────
@@ -195,9 +245,12 @@ def main():
             "area_m2": "Area m²",
             "area_est": "Area Est",
             "edge_est": "Edge Det",
+            "ml_est": "ML Base",
             "geometric": "Geometric",
             "yolo_spots": "YOLO Spots",
-            "yolo_cars": "Cars (SAHI)",
+            "segformer": "Segformer",
+            "ensemble": "🏆 Ensemble",
+            "yolo_cars": "Cars(SAHI)",
         }
         print(tabulate(all_rows, headers=headers, tablefmt="rounded_grid"))
     else:
