@@ -623,6 +623,7 @@ async def semantic_search(
             collection_name=VECTOR_COLLECTION,
             query=query_vector,
             top_k=min(candidate_k, indexed_count),
+            with_payload=True,
         )
 
     ranked: list[dict[str, Any]] = []
