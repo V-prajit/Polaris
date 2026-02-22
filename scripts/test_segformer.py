@@ -31,12 +31,17 @@ def _find_segformer_checkpoint() -> Path | None:
     candidates = [
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
-        PROJECT_ROOT / "checkpoints" / "best_model",
         PROJECT_ROOT / "models" / "segformer_best",
         PROJECT_ROOT / "models" / "best_model",
+        PROJECT_ROOT / "checkpoints" / "best_model",
     ]
     for path in candidates:
-        if path.exists():
+        if (
+            path.exists()
+            and (path / "config.json").exists()
+            and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
+            and (path / "preprocessor_config.json").exists()
+        ):
             return path
     return None
 

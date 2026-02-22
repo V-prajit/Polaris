@@ -90,6 +90,19 @@ _SURFACE_OSM_TAGS = {
     "landuse": ["parking"],
 }
 
+
+def _is_usable_segformer_dir(path: Path) -> bool:
+    """Return True only if directory has model + processor files required by transformers."""
+    if not path.exists():
+        return False
+    if not path.is_dir():
+        return False
+
+    has_config = (path / "config.json").exists()
+    has_weights = (path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists()
+    has_processor = (path / "preprocessor_config.json").exists()
+    return has_config and has_weights and has_processor
+
 def _get_detector():
     global _detector
     if _detector is None:
@@ -137,13 +150,21 @@ def _get_segmenter():
         candidate_ckpts = [
             PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
             PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
-            PROJECT_ROOT / "checkpoints" / "best_model",
             PROJECT_ROOT / "models" / "segformer_best",
             PROJECT_ROOT / "models" / "best_model",
+            PROJECT_ROOT / "checkpoints" / "best_model",
         ]
-        ckpt = next((p for p in candidate_ckpts if p.exists()), None)
+        ckpt = next((p for p in candidate_ckpts if _is_usable_segformer_dir(p)), None)
         if ckpt is None:
-            logger.info("No SegFormer checkpoint found, skipping segmentation stage.")
+            available_dirs = [str(p) for p in candidate_ckpts if p.exists()]
+            if available_dirs:
+                logger.warning(
+                    "No usable SegFormer checkpoint found (missing config/model/preprocessor files). "
+                    "Found directories: %s",
+                    available_dirs,
+                )
+            else:
+                logger.info("No SegFormer checkpoint found, skipping segmentation stage.")
             return None
         from parksight.segment import ParkingSegmenter
         logger.info("Loading SegFormer from %s ...", ckpt)
@@ -367,7 +388,7 @@ def _run_surface_detection(gdf_3857):
         count_segformer = 0
         cars = 0
         spot_method = "area"
-        segformer_available = segmenter is not None
+        segformer_available = False
 
         # Overlay data — populated only for Polygon features that go through imagery
         spot_boxes = []       # list of (x1,y1,x2,y2,conf) pixel tuples
@@ -388,6 +409,7 @@ def _run_surface_detection(gdf_3857):
             if segmenter is not None:
                 try:
                     seg_mask = segmenter.segment(img)
+                    segformer_available = True
                     result = segmenter.count_spots(img)
                     count_segformer = result.count
                     # Extract contours from the same mask for the overlay
