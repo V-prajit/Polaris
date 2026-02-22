@@ -562,20 +562,10 @@ def _infer_hyperparams_heuristic(geom: Union[Polygon, "MultiPolygon"], tags: dic
     else:
         min_m2 = 30.0
         
-    # --- STATIC CACHE INTEGRATION ---
-    from parksight.zoning import estimate_parking_limits_for_coord
-    import pyproj
-    from shapely.ops import transform
-    
-    # Reproject centroid from EPSG:3857 to EPSG:4326 (lon, lat)
-    project_to_4326 = pyproj.Transformer.from_crs('EPSG:3857', 'EPSG:4326', always_xy=True).transform
-    centroid_4326 = transform(project_to_4326, geom.centroid)
-    lon, lat = centroid_4326.x, centroid_4326.y
-    
-    rules = estimate_parking_limits_for_coord(lat, lon)
-    if rules and "error" not in rules:
-        eff_mod = rules.get("efficiency_modifier", 1.0)
-        logger.info(f"Static Caching update -> Efficiency: x{eff_mod}, Min_m2: {min_m2}")
+    # --- STATIC CACHE INTEGRATION (DISABLED) ---
+    # Zoning height heuristics from Atlanta_Zoning_Districts.geojson were degrading
+    # stall estimates. The efficiency_modifier was fetched but never applied.
+    # Disabled for Hacklytics 2026 demo.
     # ---------------------------------
 
     eff = max(0.40, min(0.95, eff))
