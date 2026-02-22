@@ -308,25 +308,26 @@ def main():
     else:
         print("[2/4] Skipping ML Baseline (--skip-ml)\n")
 
-    # --- yolo26 pipeline ---
-    print("[3/4] Running YOLO26 Pipeline...")
-    t0 = time.time()
-    yolo_counts = run_yolo_pipeline(gdf_3857, args.weights)
-    yolo_time = time.time() - t0
-    yolo_total = sum(yolo_counts)
-    results["YOLO26 (raw)"] = {"total": yolo_total, "time": yolo_time}
-    print(f"      Total: {yolo_total} spots | Time: {yolo_time:.1f}s\n")
 
-    # --- enhanced pipeline ---
-    print("[4/4] Running Enhanced Pipeline (YOLO + OSM structures + streets)...")
-    t0 = time.time()
-    enhanced_total, surface, structured, street = run_enhanced_pipeline(
-        gdf_3857, args.address, args.radius, args.weights
-    )
-    enhanced_time = time.time() - t0
-    results["Enhanced"] = {"total": enhanced_total, "time": enhanced_time}
-    print(f"      Surface: {surface} | Garages: {structured} | Street: {street}")
-    print(f"      Total: {enhanced_total} spots | Time: {enhanced_time:.1f}s\n")
+    # --- yolo26 pipeline (commented out — model not yet trained) ---
+    # print("[3/4] Running YOLO26 Pipeline...")
+    # t0 = time.time()
+    # yolo_counts = run_yolo_pipeline(gdf_3857, args.weights)
+    # yolo_time = time.time() - t0
+    # yolo_total = sum(yolo_counts)
+    # results["YOLO26 (raw)"] = {"total": yolo_total, "time": yolo_time}
+    # print(f"      Total: {yolo_total} spots | Time: {yolo_time:.1f}s\n")
+
+    # --- enhanced pipeline (commented out — requires trained YOLO model) ---
+    # print("[4/4] Running Enhanced Pipeline (YOLO + OSM structures + streets)...")
+    # t0 = time.time()
+    # enhanced_total, surface, structured, street = run_enhanced_pipeline(
+    #     gdf_3857, args.address, args.radius, args.weights
+    # )
+    # enhanced_time = time.time() - t0
+    # results["Enhanced"] = {"total": enhanced_total, "time": enhanced_time}
+    # print(f"      Surface: {surface} | Garages: {structured} | Street: {street}")
+    # print(f"      Total: {enhanced_total} spots | Time: {enhanced_time:.1f}s\n")
 
     # --- summary table ---
     print(f"\n{'='*60}")
