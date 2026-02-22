@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 VECTOR_COLLECTION = os.getenv("VECTORDB_COLLECTION", "polaris_hex_cells")
 VECTOR_DIMENSION = 768
-EMBED_MODEL = "models/text-embedding-004"
+EMBED_MODEL = "models/gemini-embedding-001"
 PLACES_RADIUS_METERS = 200
 PLACES_NEW_URL = "https://places.googleapis.com/v1/places:searchNearby"
 PLACES_LEGACY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
@@ -224,7 +224,7 @@ def _extract_embedding(response: Any) -> list[float]:
 def _embed_text_with_rest_sync(text: str, task_type: str) -> list[float]:
     api_key = _require_env("GEMINI_API_KEY")
     params = urllib.parse.urlencode({"key": api_key})
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?{params}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{EMBED_MODEL}:embedContent?{params}"
     body = {
         "content": {"parts": [{"text": text}]},
         "taskType": task_type,
