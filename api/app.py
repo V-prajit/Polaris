@@ -451,14 +451,18 @@ def estimate(
     surface_features = []
     surface_total = 0
 
-    # Check if OSM returned any polygon features (surface parking lots)
-    has_polygons = False
+    # Check if OSM returned any non-structure polygon features (actual surface lots)
+    has_surface_polygons = False
     gdf_3857 = None
     if gdf is not None and not gdf.empty:
         gdf_3857 = gdf.to_crs(epsg=3857)
-        has_polygons = gdf_3857.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).any()
+        for _, row in gdf_3857.iterrows():
+            geom = row.geometry
+            if geom.geom_type in ("Polygon", "MultiPolygon") and not is_structure(row.to_dict()):
+                has_surface_polygons = True
+                break
 
-    if not has_polygons:
+    if not has_surface_polygons:
         # No surface parking polygons in OSM — create a synthetic scan polygon
         # so YOLO can still detect cars/spots from satellite imagery
         import pyproj

@@ -526,15 +526,20 @@ def main():
     import geopandas as gpd
     from shapely.geometry import Point
     import pyproj
+    from parksight import is_structure
 
-    has_polygons = False
+    has_surface_polygons = False
     if gdf is not None and not gdf.empty:
         gdf_3857_check = gdf.to_crs(epsg=3857)
-        polygon_mask = gdf_3857_check.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
-        has_polygons = polygon_mask.any()
-        print(f"  Polygon/MultiPolygon features in OSM: {polygon_mask.sum()}")
+        for _, row in gdf_3857_check.iterrows():
+            geom = row.geometry
+            if geom.geom_type in ("Polygon", "MultiPolygon") and not is_structure(row.to_dict()):
+                has_surface_polygons = True
+                break
+        polygon_count = gdf_3857_check.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).sum()
+        print(f"  Polygon/MultiPolygon features in OSM: {polygon_count}  (non-structure surface lots: {has_surface_polygons})")
 
-    if not has_polygons:
+    if not has_surface_polygons:
         print(f"\n  *** No surface parking polygons in OSM at this location ***")
         print(f"  Creating synthetic scan polygon ({TARGET_RADIUS}m radius) for YOLO detection ...")
 
