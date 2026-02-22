@@ -269,28 +269,6 @@ function MapDashboardContent() {
         <MapLayersPanel onToggle={handleLayerToggle} delay={1.0} />
       </div>
 
-      {/* ─── Bottom Center Badge ─── */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 1.8, duration: 0.5 }}
-        className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20"
-      >
-        <div className="glass-panel rounded-full px-5 py-2 flex items-center gap-3 text-[11px]">
-          <span className="flex items-center gap-1.5 text-primary font-semibold">
-            <Sparkles className="w-3 h-3" />
-            ParkIQ
-          </span>
-          <span className="w-px h-3 bg-border" />
-          <span className="text-muted-foreground">
-            SegFormer-B4 Multi-Class Segmentation
-          </span>
-          <span className="w-px h-3 bg-border" />
-          <span className="text-muted-foreground font-mono tabular-nums">
-            {parkingMetadata.total_stalls} stalls detected
-          </span>
-        </div>
-      </motion.div>
     </div>
   );
 }

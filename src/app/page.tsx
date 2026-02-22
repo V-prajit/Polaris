@@ -58,7 +58,7 @@ export default function Home() {
             backgroundClip: "text",
           }}
         >
-          parkIQ
+          Polaris
         </h1>
 
         {/* Globe */}

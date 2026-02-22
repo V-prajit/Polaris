@@ -205,6 +205,7 @@ export default function MapView({ lat, lng, radius, layers }: MapViewProps) {
         zoom={17}
         style={{ height: "100%", width: "100%" }}
         zoomControl={false}
+        attributionControl={false}
       >
         <MapUpdater center={center} />
 
