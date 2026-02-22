@@ -6,9 +6,55 @@ from PIL import Image, ImageDraw, ImageOps, ImageEnhance # Added ImageEnhance fo
 
 from parksight import config, pick_device, is_structure
 
-# COCO class IDs for vehicles visible from above
-_VEHICLE_CLASS_IDS = {3, 4, 5, 8}  # car, van, truck, bus
-_VEHICLE_CLASS_NAMES = {3: "car", 4: "van", 5: "truck", 8: "bus"}
+# Legacy IDs seen in older checkpoints/configs.
+_VEHICLE_CLASS_IDS = {3, 4, 5, 8}
+# Standard COCO-style IDs for road vehicles.
+_COCO_VEHICLE_CLASS_IDS = {2, 3, 5, 7}
+_VEHICLE_KEYWORDS = (
+    "car",
+    "vehicle",
+    "van",
+    "truck",
+    "bus",
+    "auto",
+    "suv",
+    "pickup",
+    "taxi",
+)
+
+
+def _normalize_model_names(model_names):
+    if isinstance(model_names, dict):
+        return {int(k): str(v) for k, v in model_names.items()}
+    if isinstance(model_names, list):
+        return {i: str(v) for i, v in enumerate(model_names)}
+    return {}
+
+
+def _is_vehicle_label(label: str) -> bool:
+    name = str(label).strip().lower()
+    return any(token in name for token in _VEHICLE_KEYWORDS)
+
+
+def _is_vehicle_detection(cls_id: int, cls_name: str | None, model_names) -> bool:
+    names_map = _normalize_model_names(model_names)
+
+    # Explicit label match wins.
+    if cls_name and _is_vehicle_label(cls_name):
+        return True
+
+    # If model is single-class (common for fine-tuned aerial-car checkpoints),
+    # treat that class as vehicle.
+    if len(names_map) == 1:
+        return True
+
+    # Resolve class name via model names if possible.
+    resolved = names_map.get(int(cls_id), "")
+    if resolved and _is_vehicle_label(resolved):
+        return True
+
+    # Fallback numeric heuristics for common dataset IDs.
+    return int(cls_id) in _VEHICLE_CLASS_IDS or int(cls_id) in _COCO_VEHICLE_CLASS_IDS
 
 
 def _compute_iou(boxA, boxB):
@@ -357,6 +403,7 @@ class YOLOParkingDetector:
         """
         conf = confidence if confidence is not None else config.get("CAR_CONFIDENCE", 0.25)
         img_w, img_h = pil_image.size
+        model_names = getattr(self.model, "names", {})
 
         # ── Try SAHI sliced inference (much better for overhead imagery) ──
         try:
@@ -430,10 +477,21 @@ class YOLOParkingDetector:
             # Filter classes and map to format
             formatted_boxes = []
             for pred in all_preds:
-                cat_name = pred.category.name.lower()
-                if any(v in cat_name for v in ["car", "van", "truck", "bus"]):
+                cat_name = str(pred.category.name).lower()
+                cat_id = getattr(pred.category, "id", -1)
+                if _is_vehicle_detection(cat_id, cat_name, model_names):
                     # Keep threshold aligned with configured car confidence.
                     if pred.score.value >= conf:
+                        box = pred.bbox
+                        formatted_boxes.append((pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value))
+
+            # Fallback for custom car-only checkpoints with non-standard labels.
+            if not formatted_boxes and all_preds:
+                ckpt_path = str(getattr(self.model, "ckpt_path", "")).lower()
+                if any(token in ckpt_path for token in ("car", "vehicle", "aerial", "visdrone")):
+                    for pred in all_preds:
+                        if pred.score.value < conf:
+                            continue
                         box = pred.bbox
                         formatted_boxes.append((pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value))
                     
@@ -479,7 +537,13 @@ class YOLOParkingDetector:
 
         for box in results.boxes:
             cls_id = int(box.cls[0])
-            if cls_id not in _VEHICLE_CLASS_IDS:
+            cls_name = ""
+            try:
+                names_map = _normalize_model_names(model_names)
+                cls_name = names_map.get(cls_id, "")
+            except Exception:
+                cls_name = ""
+            if not _is_vehicle_detection(cls_id, cls_name, model_names):
                 continue
 
             if segformer_mask is not None:
@@ -497,6 +561,26 @@ class YOLOParkingDetector:
                     continue
 
             count += 1
+
+        # Final fallback for custom vehicle checkpoints with opaque class ids.
+        if count == 0 and len(results.boxes) > 0:
+            ckpt_path = str(getattr(self.model, "ckpt_path", "")).lower()
+            if any(token in ckpt_path for token in ("car", "vehicle", "aerial", "visdrone")):
+                for box in results.boxes:
+                    if segformer_mask is not None:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        cx = int((xyxy[0] + xyxy[2]) / 2)
+                        cy = int((xyxy[1] + xyxy[3]) / 2)
+                        cx = min(max(cx, 0), img_w - 1)
+                        cy = min(max(cy, 0), img_h - 1)
+                        mh, mw = segformer_mask.shape[:2]
+                        mx = int(cx * mw / img_w)
+                        my = int(cy * mh / img_h)
+                        mx = min(max(mx, 0), mw - 1)
+                        my = min(max(my, 0), mh - 1)
+                        if segformer_mask[my, mx] == 0:
+                            continue
+                    count += 1
 
         return count
 
@@ -520,6 +604,7 @@ class YOLOParkingDetector:
         """
         conf = confidence if confidence is not None else config.get("CAR_CONFIDENCE", 0.25)
         img_w, img_h = pil_image.size
+        model_names = getattr(self.model, "names", {})
 
         # ── Try SAHI sliced inference ──
         try:
@@ -581,9 +666,22 @@ class YOLOParkingDetector:
             # Filter to vehicle classes using configured confidence threshold.
             formatted_boxes = []
             for pred in all_preds:
-                cat_name = pred.category.name.lower()
-                if any(v in cat_name for v in ["car", "van", "truck", "bus"]):
+                cat_name = str(pred.category.name).lower()
+                cat_id = getattr(pred.category, "id", -1)
+                if _is_vehicle_detection(cat_id, cat_name, model_names):
                     if pred.score.value >= conf:
+                        box = pred.bbox
+                        formatted_boxes.append(
+                            (pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value)
+                        )
+
+            # Fallback for custom car-only checkpoints with non-standard labels.
+            if not formatted_boxes and all_preds:
+                ckpt_path = str(getattr(self.model, "ckpt_path", "")).lower()
+                if any(token in ckpt_path for token in ("car", "vehicle", "aerial", "visdrone")):
+                    for pred in all_preds:
+                        if pred.score.value < conf:
+                            continue
                         box = pred.bbox
                         formatted_boxes.append(
                             (pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value)
@@ -636,7 +734,13 @@ class YOLOParkingDetector:
 
         for box in results.boxes:
             cls_id = int(box.cls[0])
-            if cls_id not in _VEHICLE_CLASS_IDS:
+            cls_name = ""
+            try:
+                names_map = _normalize_model_names(model_names)
+                cls_name = names_map.get(cls_id, "")
+            except Exception:
+                cls_name = ""
+            if not _is_vehicle_detection(cls_id, cls_name, model_names):
                 continue
 
             xyxy = box.xyxy[0].cpu().numpy()
@@ -660,6 +764,31 @@ class YOLOParkingDetector:
                 float(xyxy[2]), float(xyxy[3]),
                 float(box.conf[0]),
             ))
+
+        # Final fallback for custom vehicle checkpoints with opaque class ids.
+        if count == 0 and len(results.boxes) > 0:
+            ckpt_path = str(getattr(self.model, "ckpt_path", "")).lower()
+            if any(token in ckpt_path for token in ("car", "vehicle", "aerial", "visdrone")):
+                for box in results.boxes:
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    if segformer_mask is not None:
+                        cx = int((xyxy[0] + xyxy[2]) / 2)
+                        cy = int((xyxy[1] + xyxy[3]) / 2)
+                        cx = min(max(cx, 0), img_w - 1)
+                        cy = min(max(cy, 0), img_h - 1)
+                        mh, mw = segformer_mask.shape[:2]
+                        mx = int(cx * mw / img_w)
+                        my = int(cy * mh / img_h)
+                        mx = min(max(mx, 0), mw - 1)
+                        my = min(max(my, 0), mh - 1)
+                        if segformer_mask[my, mx] == 0:
+                            continue
+                    count += 1
+                    boxes.append((
+                        float(xyxy[0]), float(xyxy[1]),
+                        float(xyxy[2]), float(xyxy[3]),
+                        float(box.conf[0]),
+                    ))
 
         return count, boxes
 

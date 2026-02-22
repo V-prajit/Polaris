@@ -422,6 +422,19 @@ def _pixel_boxes_to_wgs84(boxes_pixel, geom_3857, img_size, padding_pct=0.10):
     return wgs84_boxes
 
 
+def _raw_yolo_boxes(detections):
+    """Convert YOLO detect() tuples into (x1,y1,x2,y2,conf) boxes."""
+    boxes = []
+    for det in detections:
+        try:
+            bbox_px, conf, _ = det
+            x1, y1, x2, y2 = bbox_px
+            boxes.append((float(x1), float(y1), float(x2), float(y2), float(conf)))
+        except Exception:
+            continue
+    return boxes
+
+
 def _pixel_contours_to_wgs84(contours, geom_3857, img_size, padding_pct=0.10):
     """Convert pixel-space contours to a WGS84 GeoJSON MultiPolygon.
 
@@ -564,6 +577,16 @@ def _run_surface_detection(gdf_3857):
                     cars_nomask, car_boxes_nomask = car_detector.count_cars_with_boxes(
                         img, segformer_mask=None
                     )
+                    if cars_nomask <= 0:
+                        # Fallback: if class filtering inside count_cars_with_boxes is
+                        # too strict for a custom checkpoint, use raw detections.
+                        from parksight import config as _cfg
+                        car_conf = float(_cfg.get("CAR_CONFIDENCE", 0.25))
+                        raw_dets = car_detector.detect(img, confidence=car_conf)
+                        raw_boxes = _raw_yolo_boxes(raw_dets)
+                        if raw_boxes:
+                            cars_nomask = len(raw_boxes)
+                            car_boxes_nomask = raw_boxes
                     cars = cars_nomask
                     car_boxes = car_boxes_nomask
 
