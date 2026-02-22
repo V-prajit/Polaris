@@ -13,6 +13,8 @@ Usage:
 
 import sys
 import argparse
+import os
+import struct
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -26,24 +28,90 @@ from parksight.segment import ParkingSegmenter
 from parksight import is_structure
 
 
-def _find_segformer_checkpoint() -> Path | None:
-    """Match checkpoint search order used by the API."""
-    candidates = [
+def _is_git_lfs_pointer(file_path: Path) -> bool:
+    try:
+        with file_path.open("rb") as f:
+            head = f.read(256)
+        return head.startswith(b"version https://git-lfs.github.com/spec/v1")
+    except Exception:
+        return False
+
+
+def _iter_segformer_candidates() -> list[Path]:
+    env_ckpt = os.getenv("SEGFORMER_CKPT", "").strip()
+    candidates: list[Path] = []
+    if env_ckpt:
+        candidates.append(Path(env_ckpt))
+
+    candidates.extend([
+        PROJECT_ROOT / "models" / "best_model",
+        PROJECT_ROOT / "models" / "segformer_best",
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
-        PROJECT_ROOT / "models" / "segformer_best",
-        PROJECT_ROOT / "models" / "best_model",
         PROJECT_ROOT / "checkpoints" / "best_model",
-    ]
+    ])
+
+    for root in [PROJECT_ROOT / "models", PROJECT_ROOT / "checkpoints"]:
+        if not root.exists():
+            continue
+        for match in sorted(root.glob("*segformer*")):
+            if match.is_dir():
+                candidates.append(match)
+                nested_best = match / "best_model"
+                if nested_best.is_dir():
+                    candidates.append(nested_best)
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
     for path in candidates:
-        if (
-            path.exists()
-            and (path / "config.json").exists()
-            and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
-            and (path / "preprocessor_config.json").exists()
-        ):
-            return path
-    return None
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _checkpoint_status(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "missing dir"
+    if not path.is_dir():
+        return False, "not a directory"
+    if not (path / "config.json").exists():
+        return False, "missing config.json"
+
+    safetensors_path = path / "model.safetensors"
+    pytorch_path = path / "pytorch_model.bin"
+    if not (safetensors_path.exists() or pytorch_path.exists()):
+        return False, "missing model weights"
+
+    if safetensors_path.exists():
+        if _is_git_lfs_pointer(safetensors_path):
+            return False, "model.safetensors is a Git LFS pointer"
+        try:
+            size = safetensors_path.stat().st_size
+            if size < 16:
+                return False, "model.safetensors too small"
+            with safetensors_path.open("rb") as f:
+                header_raw = f.read(8)
+            header_len = struct.unpack("<Q", header_raw)[0]
+            if header_len <= 0 or header_len > 128 * 1024 * 1024 or header_len + 8 > size:
+                return False, f"bad safetensors header len={header_len}"
+        except Exception as exc:
+            return False, f"safetensors header read failed: {exc}"
+
+    # preprocessor_config.json is optional; ParkingSegmenter falls back to defaults.
+    return True, "usable"
+
+
+def _find_segformer_checkpoint() -> tuple[Path | None, list[tuple[Path, bool, str]]]:
+    report: list[tuple[Path, bool, str]] = []
+    for path in _iter_segformer_candidates():
+        ok, reason = _checkpoint_status(path)
+        report.append((path, ok, reason))
+        if ok:
+            return path, report
+    return None, report
 
 
 def _load_spot_yolo():
@@ -121,15 +189,14 @@ def main():
     parser.add_argument("--max-examples", type=int, default=25, help="Max tiles to include in the comparison grid (default: 25)")
     args = parser.parse_args()
 
-    model_path = _find_segformer_checkpoint()
+    model_path, ckpt_report = _find_segformer_checkpoint()
+    print("SegFormer checkpoint diagnostics:")
+    for path, ok, reason in ckpt_report:
+        marker = "OK" if ok else "SKIP"
+        print(f"  [{marker}] {path} ({reason})")
+
     if model_path is None:
         print("ERROR: SegFormer checkpoint not found.")
-        print("Checked:")
-        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg-final' / 'best_model'}")
-        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg' / 'best_model'}")
-        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'best_model'}")
-        print(f"  - {PROJECT_ROOT / 'models' / 'segformer_best'}")
-        print(f"  - {PROJECT_ROOT / 'models' / 'best_model'}")
         sys.exit(1)
 
     print(f"Loading SegFormer from {model_path} ...")

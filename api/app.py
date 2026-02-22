@@ -11,6 +11,7 @@ import time
 import logging
 from pathlib import Path
 import math
+import struct
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -69,6 +70,7 @@ app.add_middleware(
 _detector = None
 _segmenter = None
 _car_detector = None
+_segmenter_disabled = False
 
 # Synthetic scan tuning for places where OSM has no surface lot polygons.
 # Keep this small so inference stays fast and map scale remains usable.
@@ -91,17 +93,127 @@ _SURFACE_OSM_TAGS = {
 }
 
 
+def _is_git_lfs_pointer(file_path: Path) -> bool:
+    """Return True when a file is a Git LFS pointer stub, not real weights."""
+    try:
+        with file_path.open("rb") as f:
+            head = f.read(256)
+        return head.startswith(b"version https://git-lfs.github.com/spec/v1")
+    except Exception:
+        return False
+
+
+def _iter_segformer_candidate_dirs() -> list[Path]:
+    """Return ordered SegFormer checkpoint directory candidates."""
+    # Allow explicit override for debugging/deploy control.
+    env_ckpt = os.getenv("SEGFORMER_CKPT", "").strip()
+    candidates: list[Path] = []
+    if env_ckpt:
+        candidates.append(Path(env_ckpt))
+
+    # Common fixed paths in this repo.
+    candidates.extend(
+        [
+            PROJECT_ROOT / "models" / "best_model",
+            PROJECT_ROOT / "models" / "segformer_best",
+            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
+            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
+            PROJECT_ROOT / "checkpoints" / "best_model",
+        ]
+    )
+
+    # Discover additional teammate-pushed variants (e.g. models/*segformer*/best_model).
+    discover_globs = [
+        PROJECT_ROOT / "models",
+        PROJECT_ROOT / "checkpoints",
+    ]
+    for root in discover_globs:
+        if not root.exists():
+            continue
+        for match in sorted(root.glob("*segformer*")):
+            if match.is_dir():
+                candidates.append(match)
+                nested_best = match / "best_model"
+                if nested_best.is_dir():
+                    candidates.append(nested_best)
+
+    # Keep order while removing duplicates.
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
 def _is_usable_segformer_dir(path: Path) -> bool:
-    """Return True only if directory has model + processor files required by transformers."""
+    """Return True only if directory has usable SegFormer weights/config."""
     if not path.exists():
         return False
     if not path.is_dir():
         return False
 
     has_config = (path / "config.json").exists()
-    has_weights = (path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists()
+    safetensors_path = path / "model.safetensors"
+    pytorch_bin_path = path / "pytorch_model.bin"
+    has_weights = safetensors_path.exists() or pytorch_bin_path.exists()
+    if not (has_config and has_weights):
+        return False
+
+    # preprocessor_config.json is optional; ParkingSegmenter falls back to defaults.
     has_processor = (path / "preprocessor_config.json").exists()
-    return has_config and has_weights and has_processor
+    if not has_processor:
+        logger.warning(
+            "SegFormer checkpoint %s missing preprocessor_config.json; using fallback processor defaults.",
+            path,
+        )
+
+    # Validate safetensors files early; corrupted/LFS-pointer files can pass
+    # existence checks but fail later with deserialization errors.
+    if safetensors_path.exists():
+        if _is_git_lfs_pointer(safetensors_path):
+            logger.warning("SegFormer weights at %s are a Git LFS pointer file.", safetensors_path)
+            return False
+
+        # Fast header sanity check without depending on safetensors import.
+        try:
+            file_size = safetensors_path.stat().st_size
+            if file_size < 16:
+                logger.warning("Invalid SegFormer safetensors at %s: file too small.", safetensors_path)
+                return False
+            with safetensors_path.open("rb") as f:
+                header_raw = f.read(8)
+            if len(header_raw) < 8:
+                logger.warning("Invalid SegFormer safetensors at %s: unreadable header.", safetensors_path)
+                return False
+            header_len = struct.unpack("<Q", header_raw)[0]
+            if header_len <= 0 or header_len > 128 * 1024 * 1024 or (header_len + 8) > file_size:
+                logger.warning(
+                    "Invalid SegFormer safetensors at %s: bad header length (%s bytes).",
+                    safetensors_path,
+                    header_len,
+                )
+                return False
+        except Exception as exc:
+            logger.warning("Invalid SegFormer safetensors at %s: %s", safetensors_path, exc)
+            return False
+
+        try:
+            from safetensors import safe_open
+            with safe_open(str(safetensors_path), framework="pt", device="cpu") as f:
+                # Trigger header parse with minimal work.
+                _ = next(iter(f.keys()), None)
+        except ImportError:
+            # safetensors may be unavailable locally; defer final load check to transformers.
+            pass
+        except Exception as exc:
+            logger.warning("Invalid SegFormer safetensors at %s: %s", safetensors_path, exc)
+            return False
+
+    return True
 
 def _get_detector():
     global _detector
@@ -145,31 +257,38 @@ def _get_car_detector():
 
 
 def _get_segmenter():
-    global _segmenter
+    global _segmenter, _segmenter_disabled
+    if _segmenter_disabled:
+        return None
     if _segmenter is None:
-        candidate_ckpts = [
-            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
-            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
-            PROJECT_ROOT / "models" / "segformer_best",
-            PROJECT_ROOT / "models" / "best_model",
-            PROJECT_ROOT / "checkpoints" / "best_model",
-        ]
-        ckpt = next((p for p in candidate_ckpts if _is_usable_segformer_dir(p)), None)
-        if ckpt is None:
+        candidate_ckpts = _iter_segformer_candidate_dirs()
+        from parksight.segment import ParkingSegmenter
+        for ckpt in candidate_ckpts:
+            if not _is_usable_segformer_dir(ckpt):
+                continue
+            try:
+                logger.info("Loading SegFormer from %s ...", ckpt)
+                candidate = ParkingSegmenter(str(ckpt))
+                # Fail fast during startup rather than later inside estimate().
+                candidate._load()
+                _segmenter = candidate
+                logger.info("SegFormer loaded.")
+                break
+            except Exception as exc:
+                logger.warning("Skipping SegFormer checkpoint %s: %s", ckpt, exc)
+                _segmenter = None
+
+        if _segmenter is None:
+            _segmenter_disabled = True
             available_dirs = [str(p) for p in candidate_ckpts if p.exists()]
             if available_dirs:
                 logger.warning(
-                    "No usable SegFormer checkpoint found (missing config/model/preprocessor files). "
-                    "Found directories: %s",
+                    "No usable SegFormer checkpoint found after validation. Found directories: %s",
                     available_dirs,
                 )
             else:
                 logger.info("No SegFormer checkpoint found, skipping segmentation stage.")
             return None
-        from parksight.segment import ParkingSegmenter
-        logger.info("Loading SegFormer from %s ...", ckpt)
-        _segmenter = ParkingSegmenter(str(ckpt))
-        logger.info("SegFormer loaded.")
     return _segmenter
 
 
@@ -367,6 +486,7 @@ def _pixel_contours_to_wgs84(contours, geom_3857, img_size, padding_pct=0.10):
 
 def _run_surface_detection(gdf_3857):
     """Run two-stage pipeline on surface lots: SegFormer mask → YOLO detect + car count."""
+    global _segmenter, _segmenter_disabled
     detector = _get_detector()
     segmenter = _get_segmenter()
     car_detector = _get_car_detector()
@@ -416,6 +536,11 @@ def _run_surface_detection(gdf_3857):
                     seg_contours = segmenter.segment_to_contours(img)
                 except Exception as e:
                     logger.warning("SegFormer failed for feature %s: %s", idx, e)
+                    # Disable segmentation for the remainder of this process when a
+                    # checkpoint fails at runtime (e.g., corrupted weights).
+                    _segmenter = None
+                    _segmenter_disabled = True
+                    segmenter = None
 
             # Stage 2: YOLO spot detection (with optional mask filtering)
             if detector is not None:

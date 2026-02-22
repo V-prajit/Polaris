@@ -153,16 +153,66 @@ class ParkingSegmenter:
             self.is_finetuned,
         )
 
-        self._processor = SegformerImageProcessor.from_pretrained(
-            self.model_id_or_path,
-            do_resize=True,
-            size={"height": 512, "width": 512},
-            do_rescale=True,
-            do_normalize=True,
-        )
-        self._model = SegformerForSemanticSegmentation.from_pretrained(
-            self.model_id_or_path
-        ).to(self.device)
+        model_path = Path(self.model_id_or_path)
+        local_only = model_path.exists()
+
+        processor_kwargs = {
+            "do_resize": True,
+            "size": {"height": 512, "width": 512},
+            "do_rescale": True,
+            "do_normalize": True,
+        }
+        if local_only:
+            processor_kwargs["local_files_only"] = True
+
+        try:
+            self._processor = SegformerImageProcessor.from_pretrained(
+                self.model_id_or_path,
+                **processor_kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not load SegFormer processor from %s: %s. "
+                "Falling back to default SegFormer image processor settings.",
+                self.model_id_or_path,
+                exc,
+            )
+            self._processor = SegformerImageProcessor(
+                do_resize=True,
+                size={"height": 512, "width": 512},
+                do_rescale=True,
+                do_normalize=True,
+                rescale_factor=1 / 255,
+                image_mean=[0.485, 0.456, 0.406],
+                image_std=[0.229, 0.224, 0.225],
+            )
+
+        model_kwargs = {}
+        if local_only:
+            model_kwargs["local_files_only"] = True
+
+        try:
+            self._model = SegformerForSemanticSegmentation.from_pretrained(
+                self.model_id_or_path,
+                **model_kwargs,
+            ).to(self.device)
+        except Exception as exc:
+            # If safetensors is broken but pytorch_model.bin exists, force .bin load.
+            if model_path.exists() and (model_path / "pytorch_model.bin").exists():
+                logger.warning(
+                    "Failed to load safetensors for %s (%s); retrying with pytorch_model.bin.",
+                    self.model_id_or_path,
+                    exc,
+                )
+                retry_kwargs = dict(model_kwargs)
+                retry_kwargs["use_safetensors"] = False
+                self._model = SegformerForSemanticSegmentation.from_pretrained(
+                    self.model_id_or_path,
+                    **retry_kwargs,
+                ).to(self.device)
+            else:
+                raise
+
         self._model.eval()
 
     # ── Core segmentation ──────────────────────────────────────────
