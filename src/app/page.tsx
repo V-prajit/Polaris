@@ -40,43 +40,44 @@ export default function Home() {
 
     if (selectedLat && selectedLng) return;
 
-    // Atlanta bounding box: west, south, east, north
-    const ATLANTA_VIEWBOX = "-84.7,33.5,-84.1,34.0";
+    const ATLANTA_CENTER = { lat: 33.749, lon: -84.388 };
+    const PHOTON_BBOX = "-84.7,33.5,-84.1,34.0";
 
     const timeoutId = setTimeout(async () => {
       setIsSearchingSuggestions(true);
       try {
-        // Don't append Atlanta if user already typed it
-        const query = location.toLowerCase().includes("atlanta")
-          ? location
-          : `${location}, Atlanta, GA`;
-
         const params = new URLSearchParams({
-          format: "json",
-          q: query,
+          q: location,
           limit: "10",
-          countrycodes: "us",
-          viewbox: ATLANTA_VIEWBOX,
-          bounded: "1",          // restrict results to Atlanta viewbox
-          addressdetails: "1",
-          "accept-language": "en",
+          lat: String(ATLANTA_CENTER.lat),
+          lon: String(ATLANTA_CENTER.lon),
+          bbox: PHOTON_BBOX,
+          lang: "en",
         });
 
-        const res = await fetch(
-          `https://nominatim.openstreetmap.org/search?${params.toString()}`,
-          { headers: { "Accept-Language": "en" } }
-        );
+        const res = await fetch(`https://photon.komoot.io/api/?${params.toString()}`);
         const data = await res.json();
 
-        // Deduplicate by display_name
         const uniqueSuggestions: any[] = [];
         const seenNames = new Set<string>();
 
-        for (const item of (data || [])) {
-          if (!seenNames.has(item.display_name)) {
-            seenNames.add(item.display_name);
-            uniqueSuggestions.push(item);
-          }
+        for (const feature of (data?.features || [])) {
+          const props = feature.properties;
+          const coords = feature.geometry.coordinates; // [lon, lat]
+
+          const name = props.name || props.street || "";
+          const city = props.city || props.town || props.village || "";
+          const displayName = [name, city, "GA"].filter(Boolean).join(", ");
+
+          if (!name || seenNames.has(displayName)) continue;
+          seenNames.add(displayName);
+
+          uniqueSuggestions.push({
+            display_name: displayName,
+            name,
+            lat: String(coords[1]),
+            lon: String(coords[0]),
+          });
         }
 
         setSuggestions(uniqueSuggestions.slice(0, 3));
