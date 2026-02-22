@@ -60,6 +60,7 @@ function MapDashboardContent() {
   const [locationInfo, setLocationInfo] = useState<GeocodeResult>({ name: "Loading...", address: "" });
   const [layers, setLayers] = useState<Record<string, boolean>>({
     parking: true, roads: true, radius: true, satellite: true, labels: true,
+    model_area: true, model_yolo: false, model_segformer: false,
   });
 
   // Search bar state

@@ -71,23 +71,56 @@ function MapUpdater({ center }: { center: [number, number] }) {
 }
 
 // ─── Model-aware color overrides ────────────────────────────────────
-const MODEL_COLORS: Record<string, { fill: string; stroke: string }> = {
-  model_yolo: { fill: "rgba(34, 197, 94, 0.30)", stroke: "#22c55e" },       // green
-  model_segformer: { fill: "rgba(168, 85, 247, 0.30)", stroke: "#a855f7" },  // purple
-  model_area: { fill: "rgba(239, 68, 68, 0.25)", stroke: "#ef4444" },        // red (default)
+// Each model gets a distinct visual signature so the user can clearly see
+// which analysis mode is active on the parking polygons.
+const MODEL_STYLES: Record<string, {
+  fill: string;
+  stroke: string;
+  fillOpacity: number;
+  weight: number;
+  dashArray: string | undefined;
+}> = {
+  // Math Heuristics — red outlines, light red fill, solid border
+  model_area: {
+    fill: "rgba(239, 68, 68, 0.20)",
+    stroke: "#ef4444",
+    fillOpacity: 0.20,
+    weight: 2,
+    dashArray: undefined,
+  },
+  // YOLO V11 — strong green fill, dashed border
+  model_yolo: {
+    fill: "rgba(34, 197, 94, 0.40)",
+    stroke: "#22c55e",
+    fillOpacity: 0.40,
+    weight: 2.5,
+    dashArray: "6, 4",
+  },
+  // Segformer — strong purple fill, dashed border
+  model_segformer: {
+    fill: "rgba(168, 85, 247, 0.40)",
+    stroke: "#a855f7",
+    fillOpacity: 0.40,
+    weight: 2.5,
+    dashArray: "6, 4",
+  },
 };
 
 // ─── Per-feature styling (colored by type + active model) ───────────
 function makeFeatureStyle(layers: Record<string, boolean>) {
-  const activeModel = layers.model_yolo ? "model_yolo" : layers.model_segformer ? "model_segformer" : "model_area";
-  const modelColors = MODEL_COLORS[activeModel];
+  const activeModel = layers.model_yolo
+    ? "model_yolo"
+    : layers.model_segformer
+    ? "model_segformer"
+    : "model_area";
+  const mStyle = MODEL_STYLES[activeModel];
 
   return (feature: any) => {
     const fType = feature?.properties?.featureType || feature?.properties?.parking || "default";
     const isStreet = feature?.properties?.highway || fType === "street";
-    const colors = getFeatureColor(isStreet ? "street" : fType);
 
     if (isStreet) {
+      const colors = getFeatureColor("street");
       return {
         color: colors.stroke,
         weight: 4,
@@ -97,23 +130,14 @@ function makeFeatureStyle(layers: Record<string, boolean>) {
       };
     }
 
-    // Surface lots use the active model's color scheme
-    if (fType === "surface") {
-      return {
-        color: modelColors.stroke,
-        weight: 2,
-        fillColor: modelColors.fill,
-        fillOpacity: 0.30,
-        dashArray: undefined as string | undefined,
-      };
-    }
-
+    // All parking polygons (surface, garage, underground, default) use the
+    // active model's color scheme so toggling is immediately visible.
     return {
-      color: colors.stroke,
-      weight: 2,
-      fillColor: colors.fill,
-      fillOpacity: 0.25,
-      dashArray: undefined as string | undefined,
+      color: mStyle.stroke,
+      weight: mStyle.weight,
+      fillColor: mStyle.fill,
+      fillOpacity: mStyle.fillOpacity,
+      dashArray: mStyle.dashArray,
     };
   };
 }
@@ -240,21 +264,20 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         offset: [0, -10],
       });
 
-      const fType = feature.properties.featureType || "surface";
-      const colors = getFeatureColor(fType);
-
       layer.on("mouseover", () => {
+        // Brighten the current model style on hover
+        const base = featureStyle(feature);
         layer.setStyle({
-          weight: 3.5,
-          fillOpacity: 0.4,
-          color: colors.stroke,
+          ...base,
+          weight: (base.weight as number) + 1.5,
+          fillOpacity: Math.min(((base.fillOpacity as number) || 0.2) + 0.2, 0.7),
         });
       });
       layer.on("mouseout", () => {
         layer.setStyle(featureStyle(feature));
       });
     }
-  }, [layers]);
+  }, [layers, featureStyle]);
 
   const onEachRoad = useCallback((feature: any, layer: any) => {
     if (feature.properties) {
@@ -276,7 +299,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         layer.setStyle(featureStyle(feature));
       });
     }
-  }, [layers]);
+  }, [layers, featureStyle]);
 
   // ─── Overlay onEachFeature callbacks ──────────────────────────────
 
@@ -435,7 +458,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         {/* Road / Street Segments — amber lines */}
         {layers.roads && roadData && roadData.features.length > 0 && (
           <GeoJSON
-            key={"roads-" + roadData.features.length}
+            key={"roads-" + roadData.features.length + "-" + modelKey}
             data={roadData}
             style={featureStyle}
             onEachFeature={onEachRoad}
