@@ -4,8 +4,6 @@
  * and Nominatim for reverse geocoding (browser-side, CORS-friendly).
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
 // ─── Types matching /api/estimate response ───────────────────────────
 
 export interface ConfidenceBand {
@@ -78,9 +76,9 @@ export async function fetchEstimate(
         // Ignore and fall back to live backend
     }
 
-    // 2. Fall back to live API
-    const url = `${API_BASE}/api/estimate?lat=${lat}&lon=${lon}&radius=${radius}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    // 2. Fall back to live API (via server-side proxy to GPU backend)
+    const url = `/api/estimate?lat=${lat}&lon=${lon}&radius=${radius}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
     if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`API error ${res.status}: ${text || res.statusText}`);
