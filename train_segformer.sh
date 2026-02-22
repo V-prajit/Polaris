@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:h200:8
 #SBATCH --mem=500G
-#SBATCH --time=03:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
@@ -17,7 +17,7 @@ mkdir -p logs
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-torchrun --nproc_per_node=8 scripts/train_segformer.py \
+python -m torch.distributed.run --nproc_per_node=8 scripts/train_segformer.py \
   --data_dir    ~/scratch/Hacklytics/data/parkseg12k \
   --output_dir  ~/scratch/Hacklytics/checkpoints \
   --epochs 50 \
