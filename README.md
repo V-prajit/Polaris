@@ -1,126 +1,180 @@
-# ParkSight Starter Kit
+# ParkSight
 
-Estimate parking capacity from satellite imagery using computer vision and
-machine learning. Built for **Hacklytics 2026**.
+Full-stack parking intelligence from satellite imagery, OSM data, and ML.
+Built for **Hacklytics 2026**.
 
-## The Challenge
+Given any location, ParkSight estimates **total parking capacity**, **live vehicle counts**, and **utilization rates** — with confidence bands — across surface lots, garages, underground structures, and street parking.
 
-Given an address, estimate how many parking stalls exist within a radius.
-You get two baselines to beat:
+## Architecture
 
-1. **CV baseline** (fast, no ML) — Canny edge detection + Hough line counting
-2. **ML baseline** (strong) — Grounding DINO zero-shot object detection
+```
+                         ┌─────────────┐
+                         │  /api/estimate  │
+                         │  (lat, lon, r)  │
+                         └──────┬──────────┘
+                                │
+               ┌────────────────┼────────────────┐
+               ▼                ▼                ▼
+        Surface Lots      Structures        Street Parking
+        (Polygons)      (Garages/UG)       (LineStrings)
+               │                │                │
+               ▼                ▼                ▼
+     ┌─────────────────┐  floor_area ×     curb_length ×
+     │ Stage 1: WHERE   │  levels ×         0.8 × sides /
+     │ SegFormer-b5     │  usable_frac /    car_length
+     │ (ParkSeg12k)     │  stall_area
+     │ → binary mask    │       │                │
+     └────────┬────────┘       │                │
+              ▼                │                │
+     ┌─────────────────┐       │                │
+     │ Stage 2: HOW MANY│       │                │
+     │ YOLO (APKLOT)    │       │                │
+     │ → spot count     │       │                │
+     │ (mask-filtered)  │       │                │
+     └────────┬────────┘       │                │
+              ▼                │                │
+     ┌─────────────────┐       │                │
+     │ Stage 3: CARS    │       │                │
+     │ YOLO (VisDrone/  │       │                │
+     │ COCO) + SAHI     │       │                │
+     │ → vehicle count  │       │                │
+     └────────┬────────┘       │                │
+              ▼                ▼                ▼
+     ┌──────────────────────────────────────────────┐
+     │          Confidence Bands + Utilization       │
+     │  spots: {value, low, high, method}            │
+     │  cars:  {value, low, high, method}            │
+     │  utilization: cars / spots (propagated)       │
+     └──────────────────────────────────────────────┘
+```
 
-Your job: build something better.
+### Estimation Methods (ranked by reliability)
+
+| Method                     | What it does                                                   | Confidence |
+| -------------------------- | -------------------------------------------------------------- | ---------- |
+| **YOLO spot detection**    | APKLOT-trained model, each bbox = 1 stall                      | ±15%       |
+| **SegFormer mask → count** | Binary parking mask → connected components / area              | ±18%       |
+| **Geometric (ITE/NPA)**    | Reverse-engineer lot design: stall angle × module depth × rows | ±20-25%    |
+| **Area heuristic**         | `lot_area / 15.5m² × 0.50`                                     | ±25-30%    |
+| **Edge detection**         | Canny + Hough lines / 2                                        | ±25-30%    |
+| **Garage estimate**        | `floor_area × levels × 0.60 / stall_area`                      | ±25-35%    |
+| **Street estimate**        | `curb_length × 0.80 / car_length × sides`                      | ±15-25%    |
+
+### Vehicle Counting (Overhead)
+
+COCO-pretrained YOLO can't detect cars from satellite imagery (trained on street-level photos). Our solution:
+
+1. **SAHI (Slicing Aided Hyper Inference)** — slice satellite tiles into 128×128 crops with 25% overlap, run YOLO on each crop, merge detections. Cars become large enough relative to each crop for COCO YOLO to recognise.
+2. **VisDrone fine-tuned model** (planned) — YOLO fine-tuned on 6,471 drone/aerial images with vehicle classes (car, van, truck, bus). Combined with SAHI for best results.
+3. **SegFormer mask filtering** — only count vehicles inside detected parking areas, reducing false positives.
 
 ## Quick Start
 
 ```bash
-# Clone and install
-git clone <repo-url> && cd parksight-starter-kit
 pip install -r requirements.txt
 
-# Run the CLI baseline
+# API server
+python -m api.app
+# → http://localhost:8000/api/estimate?lat=33.7756&lon=-84.3963&radius=300
+
+# CLI baseline
 python examples/run_baseline.py --address "Georgia Tech, Atlanta, GA"
 
-# Or open the notebook
-jupyter notebook notebooks/01_quickstart.ipynb
-```
-
-No API keys required. Everything runs on free public data (OSM + Esri tiles).
-
-## How It Works
-
-### CV Baseline (Tier 1)
-
-```
-Address → OSMnx geocode → fetch parking features (OSM)
-  → For each Polygon:
-    Esri satellite tile → grayscale → GaussianBlur → Canny → HoughLinesP
-    → if <50 lines: area formula  else: lines/2
-  → Sum counts → Folium map
-```
-
-### ML Baseline (Tier 2)
-
-```
-Satellite tile (PIL Image)
-  → CLAHE preprocessing + morphological cleanup
-  → Grounding DINO zero-shot detection (labels: "parking space", "car")
-  → Bounding boxes → count detections
-  → Annotated image
+# Compare all estimation methods
+python scripts/test_methods.py
 ```
 
 ## Project Structure
 
 ```
-parksight-starter-kit/
-├── README.md                        # You are here
-├── LICENSE                          # MIT
-├── requirements.txt                 # pip install -r requirements.txt
-├── config.json                      # Tunable CV parameters (see below)
-│
-├── parksight/                       # Python package
-│   ├── fetch.py                     # OSM feature fetching + satellite tiles
-│   ├── count.py                     # CV baseline counting
-│   ├── detect.py                    # ML baseline (Grounding DINO)
-│   ├── imagery.py                   # Image tiling + optional GEE helpers
-│   ├── viz.py                       # Folium interactive maps
-│   └── utils.py                     # Preprocessing (CLAHE, morphology, bbox)
-│
-├── notebooks/
-│   ├── 01_quickstart.ipynb          # End-to-end walkthrough (~5 min)
-│   └── 02_improve_counting.ipynb    # ML improvement scaffolding
-│
-├── examples/
-│   └── run_baseline.py              # CLI: address → count + map
-│
-└── data/
-    └── README.md                    # Links to training datasets
+ParkSight/
+├── api/
+│   └── app.py                      # FastAPI backend (/api/estimate, /api/macro)
+├── parksight/
+│   ├── fetch.py                    # OSM feature fetching + Esri satellite tiles
+│   ├── count.py                    # Edge detection + geometric estimator
+│   ├── detect.py                   # Grounding DINO zero-shot detector
+│   ├── segment.py                  # SegFormer parking segmentation + counting
+│   ├── confidence.py               # Confidence bands + utilization calculation
+│   ├── estimate_structured.py      # Garage / underground / street estimators
+│   ├── data.py                     # ParkSeg12k dataset loader for training
+│   ├── imagery.py                  # Image tiling helpers
+│   ├── viz.py                      # Folium interactive maps
+│   └── utils.py                    # Preprocessing (CLAHE, morphology)
+├── yolo/
+│   └── detect.py                   # YOLO parking detector + SAHI car counter
+├── scripts/
+│   ├── train_segformer.py          # SegFormer-b5 fine-tuning (multi-GPU)
+│   ├── test_methods.py             # Compare all estimation methods
+│   ├── download_parkseg.py         # Download ParkSeg12k from HuggingFace
+│   └── prepare_apklot_yolo.py      # Convert APKLOT to YOLO format
+├── models/
+│   ├── yolo26n_run1.pt             # ParkSeg-trained YOLO
+│   └── best_model/                 # SegFormer checkpoint
+├── config.json                     # All tuneable parameters
+└── requirements.txt
 ```
 
-## Config Tuning Guide
+## Training
 
-Edit `config.json` to adjust the CV pipeline. Key parameters:
+### SegFormer-b5 (parking segmentation)
 
-| Parameter | Default | What it does |
-|-----------|---------|--------------|
-| `CV2.gaussian_blur.ksize` | `[5, 5]` | Blur kernel size. Larger = smoother, fewer false edges |
-| `CV2.gaussian_blur.sigma` | `1.5` | Blur standard deviation |
-| `CV2.canny.threshold1` | `50` | Lower hysteresis threshold for edge detection |
-| `CV2.canny.threshold2` | `150` | Upper hysteresis threshold for edge detection |
-| `CV2.hough_lines_p.threshold` | `100` | Min votes to detect a line. Lower = more lines |
-| `CV2.hough_lines_p.min_line_length` | `50` | Minimum line length in pixels |
-| `CV2.hough_lines_p.max_line_gap` | `10` | Max gap between line segments to merge |
-| `STALL_AREA_USA` | `32.0` | Average stall area in sq metres (area fallback) |
-| `mu` | `0.7` | Drive aisle / landscaping buffer fraction |
-| `AVG_CAR_LENGTH` | `4` | Average car length in metres (street parking) |
+Fine-tuned on ParkSeg12k (11k satellite image/mask pairs) for binary parking stall segmentation.
 
-## Ideas to Beat the Baselines
+```bash
+# Single GPU
+python scripts/train_segformer.py \
+    --data_dir data/parkseg12k \
+    --output_dir checkpoints/segformer-b5-parkseg \
+    --epochs 30 --batch_size 32 --lr 6e-5 --amp \
+    --early_stop_patience 7 --stall_class_ids 255
 
-### Better CV
-- Adaptive thresholding instead of Canny
-- Contour-based counting
-- Template matching for stall line patterns
+# Multi-GPU (8×H200)
+torchrun --nproc_per_node=8 scripts/train_segformer.py \
+    --data_dir data/parkseg12k \
+    --output_dir checkpoints/segformer-b5-parkseg \
+    --epochs 50 --batch_size 16 --lr 6e-5 --amp \
+    --early_stop_patience 10 --stall_class_ids 255
+```
 
-### Better ML
-- Fine-tune Grounding DINO or YOLOv8 on parking-specific data
-- Use SAM (Segment Anything) for stall segmentation
-- Ensemble CV + ML predictions
+### YOLO Vehicle Detection (planned)
 
-### Novel Approaches
-- Density estimation (count without detecting individuals)
-- Semantic segmentation → pixel ratio → count
-- Multi-scale tiling for large lots
-- Temporal analysis (compare occupied vs empty)
+Fine-tune on VisDrone for aerial vehicle counting:
+
+```bash
+from ultralytics import YOLO
+model = YOLO("yolo11n.pt")
+model.train(data="VisDrone.yaml", epochs=100, imgsz=640)
+```
 
 ## Datasets
 
-See [`data/README.md`](data/README.md) for download links:
-- **ParkSeg12k** — 12k aerial images with segmentation masks
-- **APKLOT** — Aerial parking lots with bounding boxes
-- **NAIP** — 1m US aerial imagery
-- **SpaceNet** — Sub-metre satellite with building footprints
+- **ParkSeg12k** — 12k aerial images with binary parking masks (HuggingFace)
+- **APKLOT** — 1,519 aerial parking lot images with bounding box annotations
+- **VisDrone** — 6,471 drone images with vehicle annotations (car/van/truck/bus)
+
+## API Response
+
+```json
+{
+  "grand_total": 500,
+  "spots": {"value": 500, "low": 375, "high": 650, "method": "default"},
+  "cars": {"value": 42, "low": 35, "high": 50, "method": "yolo_car"},
+  "utilization": {"value": 8.4, "low": 5.4, "high": 13.3},
+  "surface": {
+    "total": 320,
+    "features": [{
+      "name": "Surface #1",
+      "count": 150,
+      "spots": {"value": 150, "low": 127, "high": 173, "method": "yolo_detect"},
+      "cars": {"value": 22, "low": 18, "high": 26, "method": "yolo_car"},
+      "utilization": {"value": 14.7, "low": 10.4, "high": 20.5}
+    }]
+  },
+  "structured": { "total": 130, "features": [...] },
+  "street": { "total": 50, "features": [...] }
+}
+```
 
 ## License
 

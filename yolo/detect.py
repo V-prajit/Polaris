@@ -1,9 +1,14 @@
 import torch
+import numpy as np
 from shapely.geometry import box as shapely_box
 from ultralytics import YOLO
 from PIL import Image, ImageDraw
 
 from parksight import config, pick_device, is_structure
+
+# COCO class IDs for vehicles visible from above
+_VEHICLE_CLASS_IDS = {3, 4, 5, 8}  # car, van, truck, bus
+_VEHICLE_CLASS_NAMES = {3: "car", 4: "van", 5: "truck", 8: "bus"}
 
 
 def mask_to_bboxes(mask: "np.ndarray", min_area: int = 500) -> list:
@@ -179,6 +184,115 @@ class YOLOParkingDetector:
             return area_est * floor_multiplier
 
         return total_spots
+
+    def count_cars(self, pil_image, segformer_mask=None, confidence=None):
+        """Count vehicles visible in a satellite/aerial tile.
+
+        Uses SAHI (Slicing Aided Hyper Inference) to slice the tile into
+        small overlapping crops so that COCO-pretrained YOLO can recognise
+        vehicles from overhead.  Falls back to direct inference if SAHI
+        is not installed.
+
+        Parameters
+        ----------
+        pil_image : PIL.Image
+            Satellite tile.
+        segformer_mask : np.ndarray or None
+            Binary mask (H×W, 1=parking).  Detections outside are dropped.
+        confidence : float or None
+            Override minimum confidence threshold.
+
+        Returns
+        -------
+        int
+            Number of vehicles detected inside the parking area.
+        """
+        conf = confidence if confidence is not None else config.get("CAR_CONFIDENCE", 0.25)
+        img_w, img_h = pil_image.size
+
+        # ── Try SAHI sliced inference (much better for overhead imagery) ──
+        try:
+            from sahi import AutoDetectionModel
+            from sahi.predict import get_sliced_prediction
+            import tempfile, os
+
+            # SAHI needs a file path — write a temp file
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            pil_image.save(tmp.name)
+            tmp.close()
+
+            if not hasattr(self, "_sahi_model"):
+                self._sahi_model = AutoDetectionModel.from_pretrained(
+                    model_type="ultralytics",
+                    model_path=self.model.ckpt_path,
+                    confidence_threshold=conf,
+                    device=str(self.device),
+                )
+            self._sahi_model.confidence_threshold = conf
+
+            result = get_sliced_prediction(
+                tmp.name,
+                self._sahi_model,
+                slice_height=256,
+                slice_width=256,
+                overlap_height_ratio=0.4,
+                overlap_width_ratio=0.4,
+                verbose=0,
+            )
+            os.unlink(tmp.name)
+
+            count = 0
+            for pred in result.object_prediction_list:
+                cat = pred.category.name
+                if cat not in _VEHICLE_CLASS_NAMES.values():
+                    continue
+
+                if segformer_mask is not None:
+                    bbox = pred.bbox  # sahi BoundingBox
+                    cx = int((bbox.minx + bbox.maxx) / 2)
+                    cy = int((bbox.miny + bbox.maxy) / 2)
+                    cx = min(max(cx, 0), img_w - 1)
+                    cy = min(max(cy, 0), img_h - 1)
+                    mh, mw = segformer_mask.shape[:2]
+                    mx = int(cx * mw / img_w)
+                    my = int(cy * mh / img_h)
+                    mx = min(max(mx, 0), mw - 1)
+                    my = min(max(my, 0), mh - 1)
+                    if segformer_mask[my, mx] == 0:
+                        continue
+
+                count += 1
+            return count
+
+        except ImportError:
+            pass
+
+        # ── Fallback: direct inference (works for street-level, weak on satellite) ──
+        results = self.model(pil_image, conf=conf, verbose=False)[0]
+        count = 0
+
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            if cls_id not in _VEHICLE_CLASS_IDS:
+                continue
+
+            if segformer_mask is not None:
+                xyxy = box.xyxy[0].cpu().numpy()
+                cx = int((xyxy[0] + xyxy[2]) / 2)
+                cy = int((xyxy[1] + xyxy[3]) / 2)
+                cx = min(max(cx, 0), img_w - 1)
+                cy = min(max(cy, 0), img_h - 1)
+                mh, mw = segformer_mask.shape[:2]
+                mx = int(cx * mw / img_w)
+                my = int(cy * mh / img_h)
+                mx = min(max(mx, 0), mw - 1)
+                my = min(max(my, 0), mh - 1)
+                if segformer_mask[my, mx] == 0:
+                    continue
+
+            count += 1
+
+        return count
 
     def annotate(self, pil_image, detections):
         annotated = pil_image.copy()

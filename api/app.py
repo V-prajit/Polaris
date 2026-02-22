@@ -33,6 +33,7 @@ from parksight.fetch import (
 )
 from parksight.count import get_line_count
 from parksight.estimate_structured import estimate_structured_parking, estimate_street_parking
+from parksight.confidence import confidence_band, utilization_band
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ app.add_middleware(
 # lazy-loaded model singletons
 _detector = None
 _segmenter = None
+_car_detector = None
 
 def _get_detector():
     global _detector
@@ -74,6 +76,26 @@ def _get_detector():
             return None
         logger.info("YOLO model loaded (count_mode=%s).", _detector.count_mode)
     return _detector
+
+
+def _get_car_detector():
+    """Load a COCO-pretrained YOLO for vehicle counting."""
+    global _car_detector
+    if _car_detector is None:
+        try:
+            from yolo.detect import YOLOParkingDetector
+            weights = PROJECT_ROOT / "models" / "yolo_aerial_cars.pt"
+            if not weights.exists():
+                weights_str = "yolo_aerial_cars.pt"
+            else:
+                weights_str = str(weights)
+            logger.info("Loading COCO YOLO for car counting (%s) ...", weights_str)
+            _car_detector = YOLOParkingDetector(weights_str, count_mode="detect")
+            logger.info("Car detector loaded.")
+        except Exception as e:
+            logger.warning("Could not load car detector: %s", e)
+            return None
+    return _car_detector
 
 
 def _get_segmenter():
@@ -130,9 +152,10 @@ def _sanitize_dict(d):
 
 
 def _run_surface_detection(gdf_3857):
-    """Run two-stage pipeline on surface lots: SegFormer mask → YOLO detect."""
+    """Run two-stage pipeline on surface lots: SegFormer mask → YOLO detect + car count."""
     detector = _get_detector()
     segmenter = _get_segmenter()
+    car_detector = _get_car_detector()
     results = []
 
     for idx, row in gdf_3857.iterrows():
@@ -145,6 +168,9 @@ def _run_surface_detection(gdf_3857):
             continue
 
         count = 0
+        cars = 0
+        spot_method = "area"
+
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             img = get_satellite_tile(geom)
 
@@ -156,26 +182,41 @@ def _run_surface_detection(gdf_3857):
                 except Exception as e:
                     logger.warning("SegFormer failed for feature %s: %s", idx, e)
 
-            # Stage 2: YOLO detection (with optional mask filtering)
+            # Stage 2: YOLO spot detection (with optional mask filtering)
             if detector is not None:
                 count = detector.count_spots(
                     img, geom, osm_tags=tags, segformer_mask=seg_mask
                 )
+                spot_method = "yolo_detect" if detector.count_mode == "detect" else "segformer"
             elif seg_mask is not None:
-                # SegFormer-only fallback: area-based count from mask
                 result = segmenter.count_spots(img)
                 count = result.count
+                spot_method = result.method
             else:
-                # No models — pure area heuristic
-                from parksight import config
-                stall_area = config["STALL_AREA_M2"]
-                usable = config["USABLE_FRACTION_SURFACE"]
+                from parksight import config as _cfg
+                stall_area = _cfg["STALL_AREA_M2"]
+                usable = _cfg["USABLE_FRACTION_SURFACE"]
                 count = int((geom.area / stall_area) * usable)
+                spot_method = "area"
+
+            # Stage 3: Car counting (COCO-pretrained YOLO)
+            if car_detector is not None:
+                try:
+                    cars = car_detector.count_cars(img, segformer_mask=seg_mask)
+                except Exception as e:
+                    logger.warning("Car counting failed for feature %s: %s", idx, e)
+
         elif geom.geom_type in ("LineString", "MultiLineString"):
             count = get_line_count(geom)
+            spot_method = "street"
 
         if count <= 0:
             continue
+
+        # confidence bands
+        spot_band = confidence_band(count, method=spot_method)
+        car_band = confidence_band(cars, method="yolo_car")
+        utilization = utilization_band(car_band, spot_band)
 
         # convert geometry to wgs84 for the frontend
         geom_wgs = gpd.GeoSeries([geom], crs=3857).to_crs(4326).iloc[0]
@@ -185,6 +226,9 @@ def _run_surface_detection(gdf_3857):
             "name": tags.get("name", f"Surface #{idx}"),
             "type": "surface",
             "count": count,
+            "spots": spot_band.to_dict(),
+            "cars": car_band.to_dict(),
+            "utilization": utilization,
             "centroid": [centroid_wgs.y, centroid_wgs.x],
             "geometry": _geometry_to_coords(geom_wgs),
         })
@@ -241,10 +285,13 @@ def estimate(
             if idx in struct_wgs.index:
                 geom_wgs = struct_wgs.loc[idx].geometry
                 centroid = geom_wgs.centroid
+                method = r["type"]  # "garage" or "underground"
+                spot_band = confidence_band(r["total_spots"], method=method)
                 structured_features.append({
                     "name": r["name"],
                     "type": r["type"],
                     "count": r["total_spots"],
+                    "spots": spot_band.to_dict(),
                     "levels": r["levels"],
                     "floor_area_m2": r["floor_area_m2"],
                     "centroid": [centroid.y, centroid.x],
@@ -268,10 +315,12 @@ def estimate(
             if idx in street_wgs.index:
                 geom_wgs = street_wgs.loc[idx].geometry
                 centroid = geom_wgs.centroid
+                spot_band = confidence_band(r["total_spots"], method="street")
                 street_features.append({
                     "name": r["name"],
                     "type": "street",
                     "count": r["total_spots"],
+                    "spots": spot_band.to_dict(),
                     "length_m": r["length_m"],
                     "sides": r["sides"],
                     "centroid": [centroid.y, centroid.x],
@@ -279,7 +328,13 @@ def estimate(
                 })
 
     grand_total = surface_total + structured_total + street_total
+    total_cars = sum(f.get("cars", {}).get("value", 0) for f in surface_features)
     elapsed = round(time.time() - t_start, 2)
+
+    # aggregate confidence bands
+    grand_spot_band = confidence_band(grand_total, method="default")
+    grand_car_band = confidence_band(total_cars, method="yolo_car")
+    grand_utilization = utilization_band(grand_car_band, grand_spot_band)
 
     return _sanitize_dict({
         "lat": lat,
@@ -298,6 +353,9 @@ def estimate(
             "features": street_features,
         },
         "grand_total": grand_total,
+        "spots": grand_spot_band.to_dict(),
+        "cars": grand_car_band.to_dict(),
+        "utilization": grand_utilization,
         "elapsed_seconds": elapsed,
     })
 
