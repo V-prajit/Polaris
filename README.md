@@ -84,6 +84,21 @@ python examples/run_baseline.py --address "Georgia Tech, Atlanta, GA"
 python scripts/test_methods.py
 ```
 
+## Quick Start (Frontend)
+
+First, run the development server:
+```bash
+npm run dev
+# or
+yarn dev
+# or
+pnpm dev
+# or
+bun dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
 ## Project Structure
 
 ```
@@ -111,6 +126,7 @@ ParkSight/
 ├── models/
 │   ├── yolo26n_run1.pt             # ParkSeg-trained YOLO
 │   └── best_model/                 # SegFormer checkpoint
+├── src/                            # Next.js frontend code
 ├── config.json                     # All tuneable parameters
 └── requirements.txt
 ```
@@ -171,11 +187,10 @@ model.train(data="VisDrone.yaml", epochs=100, imgsz=640)
       "utilization": {"value": 14.7, "low": 10.4, "high": 20.5}
     }]
   },
-  "structured": { "total": 130, "features": [...] },
-  "street": { "total": 50, "features": [...] }
+  "structured": { "total": 130, "features": ["..."] },
+  "street": { "total": 50, "features": ["..."] }
 }
 ```
 
 ## License
-
 MIT
