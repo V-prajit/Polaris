@@ -557,11 +557,26 @@ def _run_surface_detection(gdf_3857):
                 count = count_area
 
             # Stage 3: Car counting (COCO-pretrained YOLO)
+            # Always run an unmasked pass first so SegFormer mask errors never
+            # suppress demo car boxes entirely.
             if car_detector is not None:
                 try:
-                    cars, car_boxes = car_detector.count_cars_with_boxes(
-                        img, segformer_mask=seg_mask
+                    cars_nomask, car_boxes_nomask = car_detector.count_cars_with_boxes(
+                        img, segformer_mask=None
                     )
+                    cars = cars_nomask
+                    car_boxes = car_boxes_nomask
+
+                    # For non-synthetic lots, also compute masked cars and keep whichever
+                    # result has more detections. This preserves precision when masks help,
+                    # without collapsing to zero when masks are noisy.
+                    if seg_mask is not None and not is_synthetic_scan:
+                        cars_masked, car_boxes_masked = car_detector.count_cars_with_boxes(
+                            img, segformer_mask=seg_mask
+                        )
+                        if cars_masked > cars_nomask:
+                            cars = cars_masked
+                            car_boxes = car_boxes_masked
                 except Exception as e:
                     logger.warning("Car counting failed for feature %s: %s", idx, e)
 

@@ -15,6 +15,7 @@ import sys
 import argparse
 import os
 import struct
+import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,21 @@ from PIL import Image, ImageDraw
 from parksight.fetch import get_parking_data_by_coords, get_satellite_tile
 from parksight.segment import ParkingSegmenter
 from parksight import is_structure
+
+
+def _synthetic_scan_radius_m(request_radius: int) -> int:
+    scaled = int(request_radius * 0.40)
+    return max(75, min(140, scaled))
+
+
+def _build_synthetic_scan_polygon(lat: float, lon: float, request_radius: int):
+    import pyproj
+    from shapely.geometry import Point as ShapelyPoint
+
+    radius_m = _synthetic_scan_radius_m(request_radius)
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    x, y = transformer.transform(lon, lat)
+    return ShapelyPoint(x, y).buffer(radius_m), radius_m
 
 
 def _is_git_lfs_pointer(file_path: Path) -> bool:
@@ -114,6 +130,19 @@ def _find_segformer_checkpoint() -> tuple[Path | None, list[tuple[Path, bool, st
     return None, report
 
 
+def _git_lfs_available() -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "lfs", "version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _load_spot_yolo():
     """Load parking-spot YOLO model for SegFormer comparison."""
     from yolo.detect import YOLOParkingDetector
@@ -197,6 +226,12 @@ def main():
 
     if model_path is None:
         print("ERROR: SegFormer checkpoint not found.")
+        lfs_pointer_reasons = [r for _, ok, r in ckpt_report if not ok and "Git LFS pointer" in r]
+        if lfs_pointer_reasons and not _git_lfs_available():
+            print("\nAll discovered checkpoints are Git LFS pointers and git-lfs is not installed.")
+            print("Install git-lfs, then run:")
+            print('  git lfs install')
+            print('  git lfs pull --include="models/**,checkpoints/**"')
         sys.exit(1)
 
     print(f"Loading SegFormer from {model_path} ...")
@@ -225,6 +260,7 @@ def main():
     total_seg = 0
     total_yolo = 0
     comparison_tiles = []  # collect for grid
+    processed_polygons = 0
 
     for idx, row in gdf_3857.iterrows():
         geom = row.geometry
@@ -233,6 +269,7 @@ def main():
         if is_structure(tags) or geom.geom_type not in ("Polygon", "MultiPolygon"):
             continue
 
+        processed_polygons += 1
         img = get_satellite_tile(geom)
         area_m2 = round(geom.area, 1)
 
@@ -284,6 +321,56 @@ def main():
                     "yolo_ann": yolo_ann,
                     "seg_ann": seg_ann,
                     "name": name,
+                    "yolo_count": yolo_count,
+                    "seg_count": seg_count,
+                })
+
+    if processed_polygons == 0:
+        print("No non-structure OSM surface polygons found; running synthetic scan fallback.")
+        synth_geom, synth_radius = _build_synthetic_scan_polygon(args.lat, args.lon, args.radius)
+        synth_tags = {
+            "name": f"Scan Area ({args.lat:.5f}, {args.lon:.5f})",
+            "amenity": "parking",
+            "parking": "surface",
+            "is_synthetic_scan": True,
+            "scan_radius_m": synth_radius,
+        }
+        img = get_satellite_tile(synth_geom)
+        area_m2 = round(synth_geom.area, 1)
+
+        result = segmenter.count_spots(img)
+        seg_count = result.count
+        total_seg += seg_count
+
+        yolo_count = "-"
+        yolo_detections = None
+        if yolo_detector is not None:
+            yolo_detections = yolo_detector.detect(img)
+            yolo_count = yolo_detector.count_spots(img, synth_geom, osm_tags=synth_tags)
+            total_yolo += yolo_count
+
+        print(f"{'SYN':<4} {'Synthetic Scan':<30} {area_m2:<10} {seg_count:<12} {result.method:<8} {str(yolo_count):<8}")
+
+        if args.save_masks:
+            seg_ann = segmenter.annotate(img, result.mask)
+            if yolo_detector is not None and yolo_detections is not None:
+                yolo_ann = yolo_detector.annotate(img, yolo_detections)
+            else:
+                yolo_ann = img.copy()
+
+            out_dir = PROJECT_ROOT / "cache"
+            out_dir.mkdir(exist_ok=True)
+            side_by_side = Image.new("RGB", (img.width * 3, img.height + 28), (20, 20, 20))
+            side_by_side.paste(_add_label(img, "Original"), (0, 0))
+            side_by_side.paste(_add_label(yolo_ann, f"YOLO: {yolo_count}"), (img.width, 0))
+            side_by_side.paste(_add_label(seg_ann, f"SegFormer: {seg_count}"), (img.width * 2, 0))
+            side_by_side.save(str(out_dir / "comparison_synthetic.png"))
+            if len(comparison_tiles) < args.max_examples:
+                comparison_tiles.append({
+                    "original": img,
+                    "yolo_ann": yolo_ann,
+                    "seg_ann": seg_ann,
+                    "name": "Synthetic Scan",
                     "yolo_count": yolo_count,
                     "seg_count": seg_count,
                 })
