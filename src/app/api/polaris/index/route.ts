@@ -3,12 +3,15 @@ import { NextRequest, NextResponse } from "next/server";
 const BACKEND_URL =
     process.env.BACKEND_URL || "http://localhost:8000";
 
-export async function POST(_req: NextRequest) {
+export async function POST(req: NextRequest) {
     const url = `${BACKEND_URL}/api/polaris/index`;
+    const body = await req.json().catch(() => null);
 
     try {
         const res = await fetch(url, {
             method: "POST",
+            headers: body ? { "Content-Type": "application/json" } : {},
+            body: body ? JSON.stringify(body) : undefined,
             signal: AbortSignal.timeout(300_000),
         });
 
