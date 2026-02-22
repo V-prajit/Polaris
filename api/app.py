@@ -71,6 +71,18 @@ _detector = None
 _segmenter = None
 _car_detector = None
 
+# Synthetic scan tuning for places where OSM has no surface lot polygons.
+# Keep this small so inference stays fast and map scale remains usable.
+_SYNTHETIC_SCAN_MIN_RADIUS_M = 40
+_SYNTHETIC_SCAN_MAX_RADIUS_M = 80
+_SYNTHETIC_SCAN_RADIUS_FACTOR = 0.20
+
+# Convert detected cars to a conservative capacity estimate in synthetic mode.
+_SYNTHETIC_CAPACITY_MULTIPLIER = 1.6
+_SYNTHETIC_CAPACITY_BUFFER = 3
+_SYNTHETIC_FALLBACK_MIN = 8
+_SYNTHETIC_FALLBACK_MAX = 48
+
 def _get_detector():
     global _detector
     if _detector is None:
@@ -163,6 +175,44 @@ def _sanitize_dict(d):
     elif isinstance(d, float) and math.isnan(d):
         return None
     return d
+
+
+def _is_synthetic_scan(tags: dict) -> bool:
+    """Return True if the feature was synthetically injected for scan fallback."""
+    raw_flag = tags.get("is_synthetic_scan")
+    if isinstance(raw_flag, bool):
+        return raw_flag
+    if isinstance(raw_flag, float) and math.isnan(raw_flag):
+        raw_flag = False
+    elif isinstance(raw_flag, str):
+        return raw_flag.strip().lower() in {"1", "true", "yes"}
+    elif raw_flag is None:
+        raw_flag = False
+
+    if bool(raw_flag):
+        return True
+    name = str(tags.get("name", "")).lower()
+    return name.startswith("scan area")
+
+
+def _synthetic_scan_radius_m(request_radius: int) -> int:
+    """Clamp synthetic scan radius so demo responses stay realistic and fast."""
+    scaled = int(request_radius * _SYNTHETIC_SCAN_RADIUS_FACTOR)
+    return max(_SYNTHETIC_SCAN_MIN_RADIUS_M, min(_SYNTHETIC_SCAN_MAX_RADIUS_M, scaled))
+
+
+def _synthetic_capacity_from_cars(cars_detected: int, area_count: int) -> int:
+    """
+    Estimate capacity for synthetic scan regions using car detections as baseline.
+
+    When no cars are seen, use a tightly clamped fallback from area estimate.
+    """
+    if cars_detected > 0:
+        from_cars = int(round(cars_detected * _SYNTHETIC_CAPACITY_MULTIPLIER))
+        return max(from_cars, cars_detected + _SYNTHETIC_CAPACITY_BUFFER)
+
+    fallback = int(area_count * 0.02)
+    return max(_SYNTHETIC_FALLBACK_MIN, min(_SYNTHETIC_FALLBACK_MAX, fallback))
 
 
 def _pixel_boxes_to_wgs84(boxes_pixel, geom_3857, img_size, padding_pct=0.10):
@@ -293,6 +343,7 @@ def _run_surface_detection(gdf_3857):
         geom = row.geometry
         tags = row.to_dict()
         is_struct = is_structure(tags)
+        is_synthetic_scan = _is_synthetic_scan(tags)
 
         # skip structures — handled by structured estimator
         if is_struct:
@@ -304,6 +355,7 @@ def _run_surface_detection(gdf_3857):
         count_segformer = 0
         cars = 0
         spot_method = "area"
+        segformer_available = segmenter is not None
 
         # Overlay data — populated only for Polygon features that go through imagery
         spot_boxes = []       # list of (x1,y1,x2,y2,conf) pixel tuples
@@ -354,6 +406,17 @@ def _run_surface_detection(gdf_3857):
                 except Exception as e:
                     logger.warning("Car counting failed for feature %s: %s", idx, e)
 
+            # Synthetic scan fallback:
+            # avoid massive area-based totals when no true OSM lot polygon exists.
+            if is_synthetic_scan:
+                baseline = _synthetic_capacity_from_cars(cars_detected=cars, area_count=count_area)
+                count = baseline
+                count_yolo = baseline
+                spot_method = "blend"
+                # SegFormer output should not be advertised if model is unavailable.
+                if not segformer_available:
+                    count_segformer = 0
+
         elif geom.geom_type in ("LineString", "MultiLineString"):
             count = get_line_count(geom)
             count_area = count
@@ -395,6 +458,9 @@ def _run_surface_detection(gdf_3857):
             "spots": spot_band.to_dict(),
             "cars": car_band.to_dict(),
             "utilization": utilization,
+            "is_synthetic_scan": is_synthetic_scan,
+            "scan_radius_m": tags.get("scan_radius_m"),
+            "segformer_available": segformer_available,
             "centroid": [centroid_wgs.y, centroid_wgs.x],
             "geometry": _geometry_to_coords(geom_wgs),
             # Detection overlay data (new fields — backwards-compatible additions)
@@ -464,14 +530,23 @@ def estimate(
 
     if not has_surface_polygons:
         # No surface parking polygons in OSM — create a synthetic scan polygon
-        # so YOLO can still detect cars/spots from satellite imagery
+        # so YOLO can still detect cars/spots from satellite imagery.
+        # Radius is clamped to avoid giant circles that inflate counts/zoom.
         import pyproj
         from shapely.geometry import Point as ShapelyPoint
+
+        scan_radius = _synthetic_scan_radius_m(radius)
         transformer_to_3857 = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
         cx, cy = transformer_to_3857.transform(lon, lat)
-        synthetic_geom = ShapelyPoint(cx, cy).buffer(radius)
+        synthetic_geom = ShapelyPoint(cx, cy).buffer(scan_radius)
         synthetic_gdf = gpd.GeoDataFrame(
-            [{"name": f"Scan Area ({lat}, {lon})", "amenity": "parking", "parking": "surface"}],
+            [{
+                "name": f"Scan Area ({lat:.5f}, {lon:.5f})",
+                "amenity": "parking",
+                "parking": "surface",
+                "is_synthetic_scan": True,
+                "scan_radius_m": scan_radius,
+            }],
             geometry=[synthetic_geom],
             crs="EPSG:3857",
         )
@@ -481,7 +556,13 @@ def estimate(
             gdf_3857 = gpd.GeoDataFrame(gdf_3857, geometry="geometry", crs="EPSG:3857")
         else:
             gdf_3857 = synthetic_gdf
-        logger.info(f"Created synthetic scan polygon for ({lat}, {lon}, {radius}m)")
+        logger.info(
+            "Created synthetic scan polygon for (%.5f, %.5f) request_radius=%sm scan_radius=%sm",
+            lat,
+            lon,
+            radius,
+            scan_radius,
+        )
 
     if gdf_3857 is not None and not gdf_3857.empty:
         surface_features = _run_surface_detection(gdf_3857)
@@ -609,6 +690,7 @@ def macro(
         return {"error": f"Bounding box too large for resolution {resolution}. Trying to generate {len(hexagons)} cells (max 200). Reduce resolution or shrink bounding box.", "status": 400}
     
     grid_features = []
+    skipped_cells = 0
     
     # quick area fallback
     from parksight import config
@@ -619,60 +701,65 @@ def macro(
     radius = int(math.sqrt(h3.cell_area(hexagons[0], unit='m^2') / math.pi)) if hexagons else 200
     
     for hex_id in hexagons:
-        lat, lon = h3.cell_to_latlng(hex_id)
-        hex_boundary = h3.cell_to_boundary(hex_id)
-        # convert (lat,lon) to (lon,lat) for GeoJSON
-        geojson_coords = [[ [lon, lat] for lat, lon in hex_boundary ]]
-        # close the loop
-        geojson_coords[0].append(geojson_coords[0][0])
-        
-        surface_total = 0
-        structured_total = 0
-        street_total = 0
-        
-        # --- surface ---
-        gdf = get_parking_data_by_coords(lat, lon, dist=radius)
-        if gdf is not None and not gdf.empty:
-            gdf_3857 = gdf.to_crs(epsg=3857)
-            for idx, row in gdf_3857.iterrows():
-                geom = row.geometry
-                tags = row.to_dict()
-                if is_structure(tags):
-                    continue
-                if geom.geom_type in ("Polygon", "MultiPolygon"):
-                    count = int((geom.area / stall_area) * usable)
-                elif geom.geom_type in ("LineString", "MultiLineString"):
-                    count = get_line_count(geom)
-                else:
-                    count = 0
-                surface_total += max(count, 0)
-                
-        # --- structured ---
-        struct_gdf = fetch_structured_parking_by_coords(lat, lon, dist=radius)
-        if not struct_gdf.empty:
-            raw = estimate_structured_parking(struct_gdf)
-            structured_total = sum(r["total_spots"] for r in raw)
-            
-        # --- street ---
-        street_gdf = fetch_street_parking_by_coords(lat, lon, dist=radius)
-        if not street_gdf.empty:
-            raw = estimate_street_parking(street_gdf)
-            street_total = sum(r["total_spots"] for r in raw)
-            
-        total = surface_total + structured_total + street_total
-        
-        grid_features.append({
-            "hex_id": hex_id,
-            "centroid": [lat, lon],
-            "total": total,
-            "surface": surface_total,
-            "structured": structured_total,
-            "street": street_total,
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": geojson_coords
-            }
-        })
+        try:
+            lat, lon = h3.cell_to_latlng(hex_id)
+            hex_boundary = h3.cell_to_boundary(hex_id)
+            # convert (lat,lon) to (lon,lat) for GeoJSON
+            geojson_coords = [[[lon, lat] for lat, lon in hex_boundary]]
+            # close the loop
+            geojson_coords[0].append(geojson_coords[0][0])
+
+            surface_total = 0
+            structured_total = 0
+            street_total = 0
+
+            # --- surface ---
+            gdf = get_parking_data_by_coords(lat, lon, dist=radius)
+            if gdf is not None and not gdf.empty:
+                gdf_3857 = gdf.to_crs(epsg=3857)
+                for _, row in gdf_3857.iterrows():
+                    geom = row.geometry
+                    tags = row.to_dict()
+                    if is_structure(tags):
+                        continue
+                    if geom.geom_type in ("Polygon", "MultiPolygon"):
+                        count = int((geom.area / stall_area) * usable)
+                    elif geom.geom_type in ("LineString", "MultiLineString"):
+                        count = get_line_count(geom)
+                    else:
+                        count = 0
+                    surface_total += max(count, 0)
+
+            # --- structured ---
+            struct_gdf = fetch_structured_parking_by_coords(lat, lon, dist=radius)
+            if not struct_gdf.empty:
+                raw = estimate_structured_parking(struct_gdf)
+                structured_total = sum(r["total_spots"] for r in raw)
+
+            # --- street ---
+            street_gdf = fetch_street_parking_by_coords(lat, lon, dist=radius)
+            if not street_gdf.empty:
+                raw = estimate_street_parking(street_gdf)
+                street_total = sum(r["total_spots"] for r in raw)
+
+            total = surface_total + structured_total + street_total
+
+            grid_features.append({
+                "hex_id": hex_id,
+                "centroid": [lat, lon],
+                "total": total,
+                "surface": surface_total,
+                "structured": structured_total,
+                "street": street_total,
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": geojson_coords
+                }
+            })
+        except Exception as exc:
+            skipped_cells += 1
+            logger.warning("Skipping macro hex %s due to error: %s", hex_id, exc)
+            continue
         
     elapsed = round(time.time() - t_start, 2)
     return {
@@ -680,6 +767,8 @@ def macro(
         "bbox": [min_lat, min_lon, max_lat, max_lon],
         "resolution": resolution,
         "hex_count": len(hexagons),
+        "processed_cells": len(grid_features),
+        "skipped_cells": skipped_cells,
         "radius_used": radius,
         "grid": grid_features,
         "elapsed_seconds": elapsed

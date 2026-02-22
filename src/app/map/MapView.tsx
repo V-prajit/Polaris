@@ -61,12 +61,14 @@ interface MapViewProps {
   polarisResults?: GeoJSON.FeatureCollection | null;
 }
 
+const TARGET_ZOOM = 19;
+
 // Helper component to recenter map when props change
-function MapUpdater({ center }: { center: [number, number] }) {
+function MapUpdater({ center, zoom }: { center: [number, number]; zoom: number }) {
   const map = useMap();
   useEffect(() => {
-    map.setView(center, 19);
-  }, [center, map]);
+    map.flyTo(center, zoom, { animate: false, duration: 0 });
+  }, [center, zoom, map]);
   return null;
 }
 
@@ -150,11 +152,28 @@ function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string,
   // Determine which count to show based on active toggle
   let displayCount = props.count; // Default fallback
   let displayMethod = "Est. Stalls";
+  const segformerUnavailable =
+    layers.model_segformer &&
+    (
+      props.segformer_available === false ||
+      (
+        props.segformer_available === undefined &&
+        (props.count_segformer === undefined || props.count_segformer === null || props.count_segformer === 0)
+      )
+    );
 
   if (isParking && fType === "surface") {
-    if (layers.model_segformer && props.count_segformer !== undefined) {
-      displayCount = props.count_segformer;
-      displayMethod = "Segformer Est.";
+    if (layers.model_segformer) {
+      if (!segformerUnavailable && props.count_segformer !== undefined) {
+        displayCount = props.count_segformer;
+        displayMethod = "Segformer Est.";
+      } else if (props.count_yolo !== undefined) {
+        displayCount = props.count_yolo;
+        displayMethod = "YOLO Fallback";
+      } else if (props.count !== undefined) {
+        displayCount = props.count;
+        displayMethod = "Fallback Est.";
+      }
     } else if (layers.model_yolo && props.count_yolo !== undefined) {
       displayCount = props.count_yolo;
       displayMethod = "YOLO V11 Est.";
@@ -173,8 +192,9 @@ function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string,
       </div>
       <div class="tooltip-row">
         <span class="tooltip-label">${displayMethod}</span>
-        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${displayCount || "—"}</span>
+        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${displayCount ?? "—"}</span>
       </div>
+      ${segformerUnavailable ? `<div class="tooltip-row"><span class="tooltip-label">Segformer</span><span class="tooltip-value" style="color:#a855f7;">Model unavailable</span></div>` : ""}
       ${props.spots_low && props.spots_high ? `<div class="tooltip-row"><span class="tooltip-label">Range</span><span class="tooltip-value">${props.spots_low}–${props.spots_high}</span></div>` : ""}
       ${props.cars > 0 ? `<div class="tooltip-row"><span class="tooltip-label">Cars Detected</span><span class="tooltip-value">${props.cars}</span></div>` : ""}
       ${props.levels ? `<div class="tooltip-row"><span class="tooltip-label">Levels</span><span class="tooltip-value">${props.levels}</span></div>` : ""}
@@ -185,7 +205,7 @@ function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string,
       <div class="tooltip-title">🛣️ ${props.name || props.short_name || "Street Segment"}</div>
       <div class="tooltip-row">
         <span class="tooltip-label">Est. Spots</span>
-        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${props.count || "—"}</span>
+        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${props.count ?? "—"}</span>
       </div>
       ${props.length_m ? `<div class="tooltip-row"><span class="tooltip-label">Length</span><span class="tooltip-value">${Math.round(props.length_m)}m</span></div>` : ""}
       ${props.sides ? `<div class="tooltip-row"><span class="tooltip-label">Sides</span><span class="tooltip-value">${props.sides}</span></div>` : ""}
@@ -201,9 +221,10 @@ function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string,
 
 const carBoxStyle = {
   color: "#ef4444",
-  weight: 1.5,
-  fillColor: "rgba(239, 68, 68, 0.25)",
-  fillOpacity: 0.25,
+  weight: 2,
+  opacity: 0.95,
+  fillColor: "#ef4444",
+  fillOpacity: 0.22,
 };
 
 const spotBoxStyle = {
@@ -233,6 +254,15 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
   const center = useMemo<[number, number]>(() => [lat, lng], [lat, lng]);
   const modelKey = layers.model_yolo ? "yolo" : layers.model_segformer ? "segformer" : "area";
   const featureStyle = useMemo(() => makeFeatureStyle(layers), [layers]);
+  const segformerHasMasks = Boolean(segformerMasks && segformerMasks.features.length > 0);
+  const segformerModelAvailable = useMemo(() => {
+    if (!data) return false;
+    return data.features.some((f: any) => f.properties?.segformer_available === true);
+  }, [data]);
+  const showSegformerUnavailableNotice = layers.model_segformer && !segformerModelAvailable;
+  const showCarBoxes =
+    (layers.model_yolo || layers.model_segformer) &&
+    Boolean(carBoxes && carBoxes.features.length > 0);
 
   // Separate parking and road features
   const parkingData = useMemo(() => {
@@ -240,7 +270,12 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
     return {
       ...data,
       features: data.features.filter(
-        (f: any) => f.properties?.amenity === "parking"
+        (f: any) => {
+          if (f.properties?.amenity !== "parking") return false;
+          if (f.properties?.is_synthetic_scan) return false;
+          const name = typeof f.properties?.name === "string" ? f.properties.name : "";
+          return !/^scan area\s*\(/i.test(name);
+        }
       ),
     };
   }, [data]);
@@ -386,7 +421,8 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
 
       <MapContainer
         center={center}
-        zoom={19}
+        zoom={TARGET_ZOOM}
+        minZoom={18}
         style={{ height: "100%", width: "100%" }}
         zoomControl={false}
         attributionControl={false}
@@ -397,7 +433,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         wheelPxPerZoomLevel={180}
         zoomAnimation={true}
       >
-        <MapUpdater center={center} />
+        <MapUpdater center={center} zoom={TARGET_ZOOM} />
 
         {/* Satellite base */}
         {layers.satellite && (
@@ -466,9 +502,9 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         )}
 
         {/* YOLO Car Boxes — red semi-transparent rectangles */}
-        {layers.model_yolo && carBoxes && carBoxes.features.length > 0 && (
+        {showCarBoxes && carBoxes && carBoxes.features.length > 0 && (
           <GeoJSON
-            key={"car-boxes-" + carBoxes.features.length}
+            key={"car-boxes-" + carBoxes.features.length + "-" + modelKey}
             data={carBoxes}
             style={() => carBoxStyle}
             onEachFeature={onEachCar}
@@ -486,7 +522,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         )}
 
         {/* Segformer Masks — purple semi-transparent polygons */}
-        {layers.model_segformer && segformerMasks && segformerMasks.features.length > 0 && (
+        {layers.model_segformer && segformerHasMasks && segformerMasks && (
           <GeoJSON
             key={"segformer-" + segformerMasks.features.length}
             data={segformerMasks}
@@ -505,6 +541,12 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
           />
         )}
       </MapContainer>
+
+      {showSegformerUnavailableNotice && (
+        <div className="pointer-events-none absolute right-3 top-3 z-[1000] rounded-md border border-purple-400/40 bg-black/70 px-3 py-2 text-[11px] font-medium text-purple-100 shadow-lg">
+          Segformer model unavailable. Showing YOLO car detections.
+        </div>
+      )}
     </div>
   );
 }

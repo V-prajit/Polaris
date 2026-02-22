@@ -40,6 +40,9 @@ export interface ParkingFeature {
   spot_boxes?: { bbox: [number, number, number, number]; conf: number }[];
   segformer_contours?: GeoJSON.Geometry;
   tile_bounds?: [number, number, number, number];
+  is_synthetic_scan?: boolean;
+  scan_radius_m?: number;
+  segformer_available?: boolean;
 }
 
 export interface EstimateResponse {
@@ -148,6 +151,11 @@ export async function forwardGeocode(
  * Convert an EstimateResponse into a GeoJSON FeatureCollection
  * that MapView and chart components can consume.
  */
+function isSyntheticScanFeature(feature: ParkingFeature): boolean {
+  if (feature.is_synthetic_scan) return true;
+  return /^scan area\s*\(/i.test(feature.name || "");
+}
+
 export function apiResponseToGeoJSON(
   data: EstimateResponse
 ): GeoJSON.FeatureCollection {
@@ -157,7 +165,11 @@ export function apiResponseToGeoJSON(
     ...data.street.features,
   ];
 
-  const features: GeoJSON.Feature[] = allFeatures.map((f) => ({
+  // Synthetic scan polygons are for backend inference only and can make map scale
+  // feel "zoomed out"; keep them out of the base geometry layer.
+  const visibleFeatures = allFeatures.filter((f) => !isSyntheticScanFeature(f));
+
+  const features: GeoJSON.Feature[] = visibleFeatures.map((f) => ({
     type: "Feature" as const,
     properties: {
       name: f.name,
@@ -180,6 +192,9 @@ export function apiResponseToGeoJSON(
       floor_area_m2: f.floor_area_m2,
       length_m: f.length_m,
       sides: f.sides,
+      is_synthetic_scan: f.is_synthetic_scan ?? false,
+      scan_radius_m: f.scan_radius_m,
+      segformer_available: f.segformer_available,
     },
     geometry: f.geometry,
   }));
@@ -271,8 +286,11 @@ export function extractOverlayData(data: EstimateResponse): OverlayData {
  * Build metadata object from EstimateResponse (replaces parking_metadata.json).
  */
 export function apiResponseToMetadata(data: EstimateResponse) {
+  const surfaceVisibleCount = data.surface.features.filter(
+    (f) => !isSyntheticScanFeature(f)
+  ).length;
   const totalFeatures =
-    data.surface.features.length +
+    surfaceVisibleCount +
     data.structured.features.length +
     data.street.features.length;
 
