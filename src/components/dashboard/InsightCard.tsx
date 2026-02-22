@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { BrainCircuit, Sparkles } from "lucide-react";
+import { Sparkles } from "lucide-react";
 
 interface InsightCardProps {
     title?: string;
@@ -23,16 +23,10 @@ export function InsightCard({
             transition={{ delay, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
             className="glass-panel rounded-xl p-5 space-y-3"
         >
-            <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold tracking-tight flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-muted-foreground" />
-                    {title}
-                </h3>
-                <span className="flex items-center gap-1.5 text-[9px] font-mono text-muted-foreground/60 bg-secondary px-2 py-0.5 rounded-full">
-                    <BrainCircuit className="w-3 h-3" />
-                    {model}
-                </span>
-            </div>
+            <h3 className="text-sm font-semibold tracking-tight flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-muted-foreground" />
+                {title}
+            </h3>
 
             <p className="text-xs text-muted-foreground leading-relaxed">
                 {text}

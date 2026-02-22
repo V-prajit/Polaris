@@ -230,6 +230,9 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
           image-rendering: -webkit-optimize-contrast;
           image-rendering: crisp-edges;
         }
+        .leaflet-tile-container {
+          transition: opacity 0.25s ease;
+        }
         .leaflet-tile {
           filter: contrast(1.01) brightness(1.005);
           image-rendering: -webkit-optimize-contrast;
@@ -242,6 +245,12 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
         style={{ height: "100%", width: "100%" }}
         zoomControl={false}
         attributionControl={false}
+        scrollWheelZoom={true}
+        zoomSnap={0}
+        zoomDelta={0.25}
+        wheelDebounceTime={40}
+        wheelPxPerZoomLevel={180}
+        zoomAnimation={true}
       >
         <MapUpdater center={center} />
 
@@ -251,6 +260,10 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
             url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
             attribution="Esri World Imagery"
             maxZoom={20}
+            keepBuffer={8}
+            updateWhenZooming={false}
+            updateWhenIdle={true}
+            crossOrigin="anonymous"
           />
         )}
 
@@ -261,6 +274,10 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
             attribution="&copy; CartoDB"
             maxZoom={20}
             opacity={0.9}
+            keepBuffer={8}
+            updateWhenZooming={false}
+            updateWhenIdle={true}
+            crossOrigin="anonymous"
           />
         )}
 

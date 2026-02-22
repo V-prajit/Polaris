@@ -119,6 +119,25 @@ export async function reverseGeocode(
     }
 }
 
+export async function forwardGeocode(
+    query: string
+): Promise<{ lat: number; lon: number; name: string; address: string }> {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
+    const res = await fetch(url, {
+        headers: { "User-Agent": "Polaris/1.0" },
+        signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) throw new Error(`Nominatim ${res.status}`);
+    const data = await res.json();
+    if (!data.length) throw new Error("Location not found");
+    return {
+        lat: parseFloat(data[0].lat),
+        lon: parseFloat(data[0].lon),
+        name: data[0].display_name.split(",")[0],
+        address: data[0].display_name,
+    };
+}
+
 // ─── Data Transformations ────────────────────────────────────────────
 
 /**
@@ -184,20 +203,29 @@ export function apiResponseToMetadata(data: EstimateResponse) {
 /**
  * Build stall breakdown items from the API response.
  */
+/** Strip raw OSM IDs like "Structure #('way', 123456)" → readable label */
+function cleanFeatureName(raw: string, fallback: string): string {
+    if (/^Structure #\(/.test(raw) || /^Surface #/.test(raw) || /^Parking #/.test(raw)) {
+        return fallback;
+    }
+    return raw;
+}
+
 export function buildStallItems(data: EstimateResponse) {
+    let surfaceIdx = 1, structIdx = 1, streetIdx = 1;
     return [
         ...data.surface.features.map((f) => ({
-            name: f.name,
+            name: cleanFeatureName(f.name, `Surface Lot #${surfaceIdx++}`),
             count: f.count,
             type: "parking" as const,
         })),
         ...data.structured.features.map((f) => ({
-            name: f.name,
+            name: cleanFeatureName(f.name, `Parking Structure #${structIdx++}`),
             count: f.count,
             type: "parking" as const,
         })),
         ...data.street.features.map((f) => ({
-            name: f.name,
+            name: cleanFeatureName(f.name, `Street Segment #${streetIdx++}`),
             count: f.count,
             type: "road" as const,
         })),

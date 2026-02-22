@@ -85,7 +85,7 @@ export function MapLayersPanel({ onToggle, delay = 0 }: MapLayersPanelProps) {
             initial={{ opacity: 0, x: 60 }}
             animate={{ opacity: 1, x: 0 }}
             transition={{ delay, duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-            className="glass-panel-strong rounded-2xl overflow-hidden w-56"
+            className="w-full"
         >
             {/* Header */}
             <button
@@ -132,7 +132,7 @@ export function MapLayersPanel({ onToggle, delay = 0 }: MapLayersPanelProps) {
                                         >
                                             <span
                                                 className="transition-colors"
-                                                style={{ color: on ? "hsl(187, 73%, 46%)" : undefined }}
+                                                style={{ color: on ? "hsl(var(--foreground))" : undefined }}
                                             >
                                                 {layer.icon}
                                             </span>
