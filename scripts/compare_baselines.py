@@ -24,7 +24,7 @@ from parksight.count import count_edges, get_line_count
 from parksight.estimate_structured import estimate_structured_parking, estimate_street_parking
 
 
-def run_geometric_baseline(gdf_3857):
+def run_geometric_baseline(gdf_3857, model_path: str | None = None, use_heuristics: bool = False):
     """Tier 0: returns (total, {row_position: count})."""
     from parksight.count import count_geometric
     from shapely.ops import unary_union
@@ -57,7 +57,12 @@ def run_geometric_baseline(gdf_3857):
             per_lot[pos] = 0
             continue
         try:
-            result = count_geometric(geom, osm_tags=row.to_dict())
+            result = count_geometric(
+                geom,
+                osm_tags=row.to_dict(),
+                model_path=model_path,
+                use_heuristics=use_heuristics,
+            )
             per_lot[pos] = result.count
             total += result.count
         except Exception as e:
@@ -68,15 +73,17 @@ def run_geometric_baseline(gdf_3857):
 
 def run_cv_baseline(gdf_3857):
     # tier 1: canny edge detection + hough lines
-    counts = []
-    for _, row in gdf_3857.iterrows():
+    counts = {}
+    for pos, (_, row) in enumerate(gdf_3857.iterrows()):
         geom = row.geometry
+        if geom.geom_type not in ("Polygon", "MultiPolygon"):
+             continue
         try:
             c = count_edges(geom)
         except Exception as e:
             print(f"  CV skip: {e}")
             c = 0
-        counts.append(c)
+        counts[pos] = c
     return counts
 
 
@@ -86,8 +93,8 @@ def run_ml_baseline(gdf_3857):
     from parksight.detect import ParkingDetector
     detector = ParkingDetector()
 
-    counts = []
-    for _, row in gdf_3857.iterrows():
+    counts = {}
+    for pos, (_, row) in enumerate(gdf_3857.iterrows()):
         geom = row.geometry
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             img = get_satellite_tile(geom)
@@ -95,8 +102,8 @@ def run_ml_baseline(gdf_3857):
         elif geom.geom_type in ("LineString", "MultiLineString"):
             c = get_line_count(geom)
         else:
-            c = 0
-        counts.append(c)
+            continue
+        counts[pos] = c
     return counts
 
 
@@ -220,7 +227,7 @@ def save_lot_images(gdf_3857, out_dir: Path, address: str,
             # Build count annotation
             lot_c = counts.get(pos, {})
             count_str = "  ".join(
-                f"{k}={v}" for k, v in lot_c.items() if v
+                f"{k}={v}" for k, v in lot_c.items() if v is not None
             ) or "no counts"
             ax.set_title(
                 f"#{i} {name}\narea={geom.area:.0f} m\u00b2  |  {count_str}",
@@ -249,6 +256,10 @@ def main():
     parser.add_argument("--max-images", type=int, default=None,
                         metavar="N",
                         help="Randomly sample N lots for images (default: all)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to SegFormer model for dynamic geometric params")
+    parser.add_argument("--heuristics", action="store_true",
+                        help="Use geometry and OSM heuristics for dynamic parameters")
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
@@ -265,17 +276,51 @@ def main():
         return
 
     num_features = len(gdf)
-    print(f"[*] Found {num_features} parking features\n")
+    print(f"[*] Found {num_features} parking features")
     gdf_3857 = gdf.to_crs(epsg=3857)
+
+    # Deduplicate: drop polygons that overlap >60% with a larger polygon
+    # (OSM often returns the same lot as both a way and a relation)
+    geoms = list(gdf_3857.geometry)
+    areas = [g.area for g in geoms]
+    keep_mask = [True] * len(geoms)
+    for _i, gi in enumerate(geoms):
+        if not keep_mask[_i] or gi.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
+        for _j, gj in enumerate(geoms):
+            if _i == _j or not keep_mask[_j] or areas[_j] <= areas[_i]:
+                continue
+            if gj.geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+            try:
+                if gi.intersection(gj).area / gi.area > 0.60:
+                    keep_mask[_i] = False
+                    break
+            except Exception:
+                pass
+    gdf_3857 = gdf_3857[keep_mask].reset_index(drop=True)
+    print(f"[*] After deduplication: {len(gdf_3857)} unique features\n")
 
     results = {}
 
     # --- tier 0: geometric baseline ---
     print("[0] Running Geometric Baseline (ITE/NPA design standards)...")
+    if args.heuristics:
+        print(f"    (using heuristic parameters)")
+    elif args.model:
+        print(f"    (using dynamic parameters from SegFormer: {args.model})")
+        
     t0 = time.time()
-    geo_total, geo_per_lot = run_geometric_baseline(gdf_3857)
+    geo_total, geo_per_lot = run_geometric_baseline(gdf_3857, model_path=args.model, use_heuristics=args.heuristics)
     geo_time = time.time() - t0
-    results["Geometric (design std)"] = {"total": geo_total, "time": geo_time}
+    
+    tier_name = "Geometric (design std)"
+    if args.heuristics:
+        tier_name = "Geometric (heuristics)"
+    elif args.model:
+        tier_name = "Geometric (dynamic segformer)"
+    	
+    results[tier_name] = {"total": geo_total, "time": geo_time}
     print(f"    Total: {geo_total} spots | Time: {geo_time:.1f}s\n")
 
     # --- tier 1: cv baseline ---
@@ -283,16 +328,17 @@ def main():
     t0 = time.time()
     cv_counts = run_cv_baseline(gdf_3857)
     cv_time = time.time() - t0
-    cv_total = sum(cv_counts)
+    cv_total = sum(cv_counts.values())
     results["CV Baseline"] = {"total": cv_total, "time": cv_time}
     print(f"      Total: {cv_total} spots | Time: {cv_time:.1f}s\n")
 
     # Build per-lot counts dict for image labels {row_pos: {method: count}}
     per_lot_counts: dict = {}
-    for pos, c in enumerate(cv_counts):
+    for pos, c in cv_counts.items():
         per_lot_counts.setdefault(pos, {})["cv"] = c
     for pos, c in geo_per_lot.items():
-        per_lot_counts.setdefault(pos, {})["geo"] = c
+        if c > 0 or pos in cv_counts:
+            per_lot_counts.setdefault(pos, {})["geo"] = c
 
     # --- tier 2: ml baseline ---
     if not args.skip_ml:
@@ -300,10 +346,10 @@ def main():
         t0 = time.time()
         ml_counts = run_ml_baseline(gdf_3857)
         ml_time = time.time() - t0
-        ml_total = sum(ml_counts)
+        ml_total = sum(ml_counts.values())
         results["ML Baseline"] = {"total": ml_total, "time": ml_time}
         print(f"      Total: {ml_total} spots | Time: {ml_time:.1f}s\n")
-        for pos, c in enumerate(ml_counts):
+        for pos, c in ml_counts.items():
             per_lot_counts.setdefault(pos, {})["ml"] = c
     else:
         print("[2/4] Skipping ML Baseline (--skip-ml)\n")
@@ -330,6 +376,17 @@ def main():
     # print(f"      Total: {enhanced_total} spots | Time: {enhanced_time:.1f}s\n")
 
     # --- summary table ---
+    print(f"\n{'='*60}")
+    print(f"  PER LOT COUNTS")
+    print(f"{'='*60}")
+    print(f"  {'Lot ID':<10} {'Geo':>8} {'CV':>8} {'ML':>8}")
+    print(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*8}")
+    for pos, counts_dict in sorted(per_lot_counts.items()):
+        geo_c = counts_dict.get('geo', 'N/A')
+        cv_c = counts_dict.get('cv', 'N/A')
+        ml_c = counts_dict.get('ml', 'N/A')
+        print(f"  Lot {pos:<6} {geo_c:>8} {cv_c:>8} {ml_c:>8}")
+        
     print(f"\n{'='*60}")
     print(f"  RESULTS SUMMARY")
     print(f"{'='*60}")

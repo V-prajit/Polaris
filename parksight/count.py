@@ -142,104 +142,119 @@ def visualize_pipeline(geom, padding_pct=0.10, zoom=19):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geometric / design-standards estimator
+# Geometric / design-standards estimator (v2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class GeometricResult:
     """Result of the geometric parking-design estimator."""
-    count: int            # estimated number of stalls
-    best_angle_deg: float # stall angle that maximised count (90 / 60 / 45 / 0)
-    layout: str           # "double-loaded", "single-loaded", "parallel", "irregular"
-    lot_area_m2: float    # polygon area in m²
-    gross_per_stall_m2: float  # implied gross area per stall
-    solidity: float = 1.0 # polygon area / convex hull area (compactness measure)
+    count: int                     # estimated number of stalls
+    best_angle_deg: float          # stall angle that maximised count
+    layout: str                    # "double-loaded", "single-loaded", "parallel", "irregular"
+    lot_area_m2: float             # polygon area in m²
+    gross_per_stall_m2: float      # implied gross area per stall
+    solidity: float = 1.0          # polygon area / convex hull area
+    parking_type: str = "surface"  # "surface", "multi_storey", "underground", "rooftop"
+    levels: int = 1                # floors used in estimate
+    osm_capacity: int | None = None  # raw OSM capacity tag if present
 
 
-def count_geometric(
-    geom: Union[Polygon, "MultiPolygon"],
-    osm_tags: dict | None = None,
-    stall_w: float = 2.6,
-    stall_d: float = 5.5,
-    aisle_w: float = 7.3,
-    efficiency: float = 0.85,
+# ── Internal helpers ─────────────────────────────────────────────────────────
+
+def _detect_parking_type(tags: dict) -> str:
+    """Classify parking structure from OSM tags."""
+    parking = str(tags.get("parking", "")).lower().replace("-", "_")
+    building = str(tags.get("building", "")).lower()
+
+    if parking in ("multi_storey",) or building in ("parking", "garage", "garages"):
+        return "multi_storey"
+    if parking == "underground":
+        return "underground"
+    if parking in ("rooftop", "roof"):
+        return "rooftop"
+    return "surface"
+
+
+def _read_levels(tags: dict, parking_type: str) -> int:
+    """Read level count from OSM tags, falling back to config defaults."""
+    # Try explicit level tags
+    for key in ("parking:levels", "building:levels", "levels",
+                "building:levels:underground"):
+        val = tags.get(key)
+        if val is not None:
+            try:
+                n = int(float(val))
+                if n > 0:
+                    return n
+            except (ValueError, TypeError):
+                continue
+
+    # Defaults from config
+    if parking_type == "underground":
+        return config.get("DEFAULT_UNDERGROUND_LEVELS", 2)
+    if parking_type == "multi_storey":
+        return config.get("DEFAULT_GARAGE_LEVELS", 3)
+    return 1  # surface / rooftop
+
+
+def _read_osm_capacity(tags: dict) -> int | None:
+    """Parse the OSM capacity=* tag if present."""
+    val = tags.get("capacity")
+    if val is None:
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def _subtract_interior_rings(geom) -> float:
+    """Return usable area: exterior minus interior ring (hole) areas."""
+    if geom.geom_type == "Polygon":
+        return geom.area  # shapely already subtracts holes
+    # MultiPolygon: sum of all polygon areas (holes already subtracted)
+    return sum(p.area for p in geom.geoms)
+
+
+def _surface_lot_estimate(
+    geom,
+    tags: dict,
+    stall_w: float,
+    stall_d: float,
+    aisle_w_90: float,
+    efficiency: float,
+    solidity: float,
+    min_m2_override: float | None = None,
+    forced_angle: float | None = None,
 ) -> GeometricResult:
     """
-    Estimate parking spots by reverse-engineering standard lot design (ITE/NPA).
+    OBB-based surface lot estimator (ITE/NPA design standards).
 
-    Algorithm
-    ---------
-    1. Compute the lot's **minimum oriented bounding rectangle** (tightest OBB,
-       not axis-aligned), giving ``short_side`` and ``long_side`` in metres.
-    2. For each candidate stall angle (90°, 60°, 45°):
-       - Double-loaded module width = 2 × stall_depth + aisle_width = 18.3 m (90°)
-       - Modules across short side → 2 rows per module (+ possible edge row)
-       - Stalls per row along long side = long_side / stall_pitch
-       - raw_count = n_rows × stalls_per_row
-    3. Pick the angle that maximises raw_count.
-    4. Apply ``efficiency`` factor (dead corners, disabled bays, cart corrals).
-    5. Respect ``parking:orientation`` OSM tag if present.
-
-    Parameters
-    ----------
-    geom : Polygon | MultiPolygon
-        Parking lot in **EPSG:3857** (metres).
-    osm_tags : dict or None
-        Raw OSM feature tags.
-    stall_w : float
-        Stall width [m] — US standard 2.6 m (8.5 ft).
-    stall_d : float
-        Stall depth [m] — US standard 5.5 m (18 ft).
-    aisle_w : float
-        Two-way drive-aisle width [m] — 7.3 m (24 ft) for 90°.
-    efficiency : float
-        Fraction of theoretical capacity that is usable (default 0.85).
-
-    Returns
-    -------
-    GeometricResult
+    Improvements over v1:
+    - Angle-specific aisle widths (90°=7.3m, 60°=5.5m, 45°=4.0m)
+    - Aspect-ratio detection: very narrow lots → parallel/single-loaded
+    - Interior rings (holes) subtracted from usable area
+    - Tiny lots (<50 m²) and huge lots (>50,000 m²) handled specially
     """
-    from shapely.ops import unary_union as _uu
-
-    tags = osm_tags or {}
-
-    # ── merge multi-polygons ──────────────────────────────────────────────────
-    if geom.geom_type == "MultiPolygon":
-        geom = _uu(geom)
-
-    lot_area = geom.area  # m²
-
-    # ── Solidity check: filter out campus-zone / non-parking polygons ─────────
-    # Solidity = polygon area / convex hull area.
-    # Real parking lots are compact (0.7–1.0).
-    # Jagged campus zones wrapping buildings score 0.2–0.4.
-    # We scale effective area by solidity so irregular polygons get lower counts.
-    try:
-        convex_area = geom.convex_hull.area
-        solidity = lot_area / convex_area if convex_area > 0 else 1.0
-    except Exception:
-        solidity = 1.0
-
-    # Very non-compact: almost certainly not a real parking lot
-    if solidity < 0.25:
-        logger.warning(
-            "Polygon solidity=%.2f < 0.25 — likely a campus zone, not a parking lot. "
-            "Returning 0.", solidity
-        )
-        return GeometricResult(
-            count=0, best_angle_deg=0.0, layout="irregular",
-            lot_area_m2=lot_area, gross_per_stall_m2=float("inf"),
-            solidity=solidity,
-        )
-
-    # Scale the effective area by solidity (irregular areas contain less usable pavement)
+    lot_area = _subtract_interior_rings(geom)
     effective_area = lot_area * solidity
 
+    # ── Tiny lot guard ────────────────────────────────────────────────────
+    if lot_area < 50.0:
+        return GeometricResult(
+            count=0, best_angle_deg=0.0, layout="too_small",
+            lot_area_m2=lot_area, gross_per_stall_m2=float("inf"),
+            solidity=solidity, parking_type="surface", levels=1,
+        )
 
-    # ── read OSM orientation hint ─────────────────────────────────────────────
+    # ── Huge lot: likely a mapped zone — reduce efficiency ────────────────
+    if lot_area > 50_000:
+        efficiency = min(efficiency, 0.70)
+
+    # ── Read OSM orientation hint ─────────────────────────────────────────
     orientation = str(
         tags.get("parking:orientation")
         or tags.get("orientation")
@@ -247,22 +262,7 @@ def count_geometric(
         or ""
     ).lower()
 
-    # Parallel parking: car fits lengthwise, one row per ~car-width strip
-    if orientation in ("parallel", "street_side", "on_street"):
-        gross = stall_w * stall_d   # 2.6 × 5.5 ≈ 14.3 m²
-        count = max(0, int((lot_area / gross) * efficiency))
-        return GeometricResult(
-            count=count, best_angle_deg=0.0, layout="parallel",
-            lot_area_m2=lot_area, gross_per_stall_m2=gross,
-        )
-
-    # Limit angle search if OSM gives a hint
-    if orientation in ("diagonal", "angled"):
-        candidate_angles = [60.0, 45.0]
-    else:
-        candidate_angles = [90.0, 60.0, 45.0]
-
-    # ── minimum oriented bounding rectangle ──────────────────────────────────
+    # ── Minimum oriented bounding rectangle ──────────────────────────────
     mbr = geom.minimum_rotated_rectangle
     coords = list(mbr.exterior.coords)[:4]
     sides = sorted(
@@ -270,27 +270,61 @@ def count_geometric(
         for i in range(3)
     )
     mbr_short, mbr_long = sides[0], sides[1]
+    aspect = mbr_long / mbr_short if mbr_short > 0 else float("inf")
+
+    # ── Narrow lots or explicit parallel → parallel layout ───────────────
+    if orientation in ("parallel", "street_side", "on_street") or aspect > 8.0:
+        gross = stall_w * stall_d
+        count = max(0, int((effective_area / gross) * efficiency))
+        return GeometricResult(
+            count=count, best_angle_deg=0.0, layout="parallel",
+            lot_area_m2=lot_area, gross_per_stall_m2=gross,
+            solidity=solidity, parking_type="surface", levels=1,
+        )
+
+    # ── Angle-specific aisle widths (ITE standards) ──────────────────────
+    aisle_widths = {
+        90.0: config.get("AISLE_WIDTH_90", 7.3),
+        60.0: config.get("AISLE_WIDTH_60", 5.5),
+        45.0: config.get("AISLE_WIDTH_45", 4.0),
+    }
+
+    if orientation in ("diagonal", "angled"):
+        candidate_angles = [60.0, 45.0]
+    elif forced_angle is not None:
+        candidate_angles = [forced_angle]
+    else:
+        candidate_angles = [90.0, 60.0, 45.0]
 
     best_count = 0
     best_angle = 90.0
-    best_gross = lot_area  # fallback: 1 stall
+    best_gross = lot_area
+    best_layout = "double-loaded"
 
     for angle in candidate_angles:
         rad = math.radians(angle)
+        aisle_w = aisle_widths.get(angle, aisle_w_90)
 
-        # Stall pitch along the row (widens for angled stalls)
+        # Stall pitch along the row
         eff_pitch = stall_w if angle == 90.0 else stall_w / math.sin(rad)
 
-        # Double-loaded module depth across the short axis
-        module_w = 2.0 * stall_d + aisle_w          # e.g. 18.3 m at 90°
+        # Double-loaded module depth
+        module_w = 2.0 * stall_d + aisle_w
 
         n_modules = int(mbr_short / module_w)
         n_rows = n_modules * 2
+        layout = "double-loaded"
 
-        # One extra single-loaded row if space allows
+        # Extra single-loaded row in remaining space
         remaining = mbr_short - n_modules * module_w
         if remaining >= stall_d + aisle_w / 2:
             n_rows += 1
+            layout = "double-loaded+edge"
+
+        # Very narrow: can only fit single-loaded
+        if n_modules == 0 and mbr_short >= stall_d + aisle_w / 2:
+            n_rows = 1
+            layout = "single-loaded"
 
         stalls_per_row = max(0, int(mbr_long / eff_pitch))
         raw = n_rows * stalls_per_row
@@ -300,22 +334,278 @@ def count_geometric(
             best_count = raw
             best_angle = angle
             best_gross = gross
+            best_layout = layout
 
-    # ── Cap by effective polygon area (solidity-adjusted) ────────────────────
-    # OBB can be much larger than the actual polygon for irregular lots.
-    # Physical upper bound: 1 stall per (stall_w × stall_d) = 14.3 m² minimum.
-    # We use effective_area (= lot_area × solidity) so jagged campus zones
-    # can't inflate the count beyond what their usable footprint supports.
-    min_m2_per_stall = stall_w * stall_d  # 14.3 m²
+    # ── Cap by effective area ────────────────────────────────────────────
+    # Use ITE gross area per stall (25 m²) as a more realistic floor.
+    # stall_w × stall_d = 14.3 m² is the theoretical minimum (no aisle share);
+    # real lots use 25–30 m² gross including circulation.
+    # min_m2_override allows imagery.py to supply a per-lot measured value.
+    if min_m2_override is not None:
+        min_m2_per_stall = float(np.clip(min_m2_override, 10.0, 60.0))
+    else:
+        min_m2_per_stall = max(stall_w * stall_d, 30.0)
     area_cap = int((effective_area / min_m2_per_stall) * efficiency)
     final = min(max(0, int(best_count * efficiency)), area_cap)
 
     return GeometricResult(
         count=final,
         best_angle_deg=best_angle,
-        layout="double-loaded",
+        layout=best_layout,
         lot_area_m2=lot_area,
         gross_per_stall_m2=best_gross,
         solidity=solidity,
+        parking_type="surface",
+        levels=1,
     )
 
+
+def count_geometric(
+    geom: Union[Polygon, "MultiPolygon"],
+    osm_tags: dict | None = None,
+    stall_w: float = 2.6,
+    stall_d: float = 5.5,
+    aisle_w: float = 7.3,
+    efficiency: float = 0.60,
+    model_path: str | None = None,
+    use_heuristics: bool = False,
+) -> GeometricResult:
+    """
+    Estimate parking spots from polygon geometry + OSM tags.
+
+    Handles:
+    - Surface lots (OBB layout simulation with angle-specific aisles)
+    - Multi-storey garages (floor area × levels × garage efficiency)
+    - Underground parking (floor area × levels × garage efficiency)
+    - Rooftop parking (single floor, surface efficiency)
+    - OSM capacity tag blending (60% OSM / 40% geometric)
+    - Edge cases: tiny lots, huge lots, narrow lots, interior rings
+    - Dynamic parameter inference from SegFormer satellite tile (if model_path set)
+
+    Parameters
+    ----------
+    geom : Polygon | MultiPolygon
+        Parking lot in **EPSG:3857** (metres).
+    osm_tags : dict or None
+        Raw OSM feature tags.
+    stall_w, stall_d, aisle_w, efficiency : float
+        Design parameters (US defaults).
+    model_path : str or None
+        Path to a fine-tuned SegFormer checkpoint.  When provided, runs
+        ``infer_geometric_params()`` on the satellite tile to obtain
+        per-lot efficiency and stall size instead of the static defaults.
+    use_heuristics : bool
+        If True, infer parameters (efficiency, stall size, angle) based on 
+        the geometry's shape and OSM tags rather than using SegFormer or defaults.
+
+    Returns
+    -------
+    GeometricResult
+    """
+    from shapely.ops import unary_union as _uu
+
+    tags = osm_tags or {}
+
+    # ── Merge MultiPolygon ───────────────────────────────────────────────
+    if geom.geom_type == "MultiPolygon":
+        geom = _uu(geom)
+
+    lot_area = _subtract_interior_rings(geom)
+
+    # ── Solidity ─────────────────────────────────────────────────────────
+    try:
+        convex_area = geom.convex_hull.area
+        solidity = lot_area / convex_area if convex_area > 0 else 1.0
+    except Exception:
+        solidity = 1.0
+
+    if solidity < 0.25:
+        logger.warning(
+            "Polygon solidity=%.2f < 0.25 — likely a campus zone. Returning 0.",
+            solidity,
+        )
+        return GeometricResult(
+            count=0, best_angle_deg=0.0, layout="irregular",
+            lot_area_m2=lot_area, gross_per_stall_m2=float("inf"),
+            solidity=solidity, parking_type="surface",
+        )
+
+    # ── Detect parking type ──────────────────────────────────────────────
+    parking_type = _detect_parking_type(tags)
+    levels = _read_levels(tags, parking_type)
+    osm_cap = _read_osm_capacity(tags)
+
+    # ── Dynamic parameter inference ──────────────────────────────────────
+    min_m2_override = None
+    if use_heuristics:
+        eff_est, m2_est, angle_est = _infer_hyperparams_heuristic(geom, tags)
+        efficiency = eff_est
+        min_m2_override = m2_est
+        forced_angle = angle_est
+        print(f"    [geom] Heuristic params: eff={efficiency:.2f}, m2/stall={min_m2_override:.1f}, angle={forced_angle}")
+    elif model_path is not None:
+        try:
+            from parksight.imagery import infer_geometric_params
+            params = infer_geometric_params(geom, model_path)
+            efficiency = params.efficiency
+            min_m2_override = params.min_m2_per_stall
+            forced_angle = params.stall_angle_deg
+            print(f"    [geom] Dynamic params: eff={efficiency:.2f}, m2/stall={min_m2_override:.1f}, angle={forced_angle}")
+        except Exception as e:
+            logger.warning("Dynamic parameter inference failed: %s", e)
+            forced_angle = None
+    else:
+        forced_angle = None
+
+    # ── Structured parking (garage / underground) ────────────────────────
+    if parking_type in ("multi_storey", "underground"):
+        stall_area = config.get("STALL_AREA_M2", 15.5)
+        usable_frac = config.get("USABLE_FRACTION_GARAGE", 0.60)
+
+        spots_per_floor = int(lot_area * usable_frac / stall_area)
+        estimate = spots_per_floor * levels
+
+        # Blend with OSM capacity if available
+        if osm_cap is not None and osm_cap > 0:
+            estimate = int(0.6 * osm_cap + 0.4 * estimate)
+
+        gross = lot_area / max(spots_per_floor, 1)
+
+        return GeometricResult(
+            count=max(estimate, 0),
+            best_angle_deg=90.0,
+            layout="structured",
+            lot_area_m2=lot_area,
+            gross_per_stall_m2=gross,
+            solidity=solidity,
+            parking_type=parking_type,
+            levels=levels,
+            osm_capacity=osm_cap,
+        )
+
+    # ── Rooftop parking (single floor, surface efficiency) ───────────────
+    if parking_type == "rooftop":
+        stall_area = config.get("STALL_AREA_M2", 15.5)
+        usable_frac = config.get("USABLE_FRACTION_SURFACE", 0.50)
+        estimate = int(lot_area * usable_frac / stall_area)
+
+        if osm_cap is not None and osm_cap > 0:
+            estimate = int(0.6 * osm_cap + 0.4 * estimate)
+
+        return GeometricResult(
+            count=max(estimate, 0),
+            best_angle_deg=90.0,
+            layout="rooftop",
+            lot_area_m2=lot_area,
+            gross_per_stall_m2=lot_area / max(estimate, 1),
+            solidity=solidity,
+            parking_type="rooftop",
+            levels=1,
+            osm_capacity=osm_cap,
+        )
+
+    # ── Surface lot (OBB-based layout simulation) ────────────────────────
+    result = _surface_lot_estimate(
+        geom, tags, stall_w, stall_d, aisle_w, efficiency, solidity,
+        min_m2_override=min_m2_override, forced_angle=forced_angle,
+    )
+
+    # Blend with OSM capacity if available
+    if osm_cap is not None and osm_cap > 0:
+        blended = int(0.6 * osm_cap + 0.4 * result.count)
+        result = GeometricResult(
+            count=blended,
+            best_angle_deg=result.best_angle_deg,
+            layout=result.layout,
+            lot_area_m2=result.lot_area_m2,
+            gross_per_stall_m2=result.gross_per_stall_m2,
+            solidity=result.solidity,
+            parking_type="surface",
+            levels=1,
+            osm_capacity=osm_cap,
+        )
+
+    return result
+
+
+def _infer_hyperparams_heuristic(geom: Union[Polygon, "MultiPolygon"], tags: dict) -> tuple[float, float, float | None]:
+    """
+    Infers layout hyperparameters based on simple geometric and OSM metadata rules.
+    Returns: (efficiency, min_m2_per_stall, stall_angle_deg)
+    """
+    from parksight.features import extract_geom_features
+    feats = extract_geom_features(geom)
+    area = feats["area_m2"]
+    
+    # 1. Efficiency
+    # Base efficiency on how regular the shape is. Re-entrant shapes (L-shapes) waste space.
+    # Lots that fill their bounding box well can be packed more tightly.
+    base_eff = 0.65
+    if area < 500:
+        base_eff = 0.80
+    elif area > 10000:
+        base_eff = 0.55
+        
+    # Penalize efficiency for highly irregular shapes
+    fill_ratio = feats.get("obb_fill_ratio", 1.0)
+    convex_ratio = feats.get("convex_hull_ratio", 1.0)
+    
+    # A perfect rectangle has fill_ratio=1.0. A weird lot might have 0.5.
+    # We blend this down slightly.
+    eff = base_eff * ((fill_ratio + convex_ratio) / 2.0)
+        
+    # 2. Min m2 per stall
+    # Garages pack spots tighter, surface lots often have wider default painted lines/aisles
+    parking_type = _detect_parking_type(tags)
+    if parking_type in ("multi-storey", "underground"):
+        min_m2 = 25.0
+    else:
+        min_m2 = 30.0
+        
+    # --- STATIC CACHE INTEGRATION ---
+    from parksight.zoning import estimate_parking_limits_for_coord
+    import pyproj
+    from shapely.ops import transform
+    
+    # Reproject centroid from EPSG:3857 to EPSG:4326 (lon, lat)
+    project_to_4326 = pyproj.Transformer.from_crs('EPSG:3857', 'EPSG:4326', always_xy=True).transform
+    centroid_4326 = transform(project_to_4326, geom.centroid)
+    lon, lat = centroid_4326.x, centroid_4326.y
+    
+    rules = estimate_parking_limits_for_coord(lat, lon)
+    if rules and "error" not in rules:
+        eff_mod = rules.get("efficiency_modifier", 1.0)
+        logger.info(f"Static Caching update -> Efficiency: x{eff_mod}, Min_m2: {min_m2}")
+    # ---------------------------------
+
+    eff = max(0.40, min(0.95, eff))
+
+    # 3. Angle
+    # If the lot is extremely long and narrow, assume 0 or 90 depending on 
+    # orientation, otherwise allow the optimizer to run free
+    forced_angle = None
+    try:
+        from shapely import minimum_rotated_rectangle # type: ignore
+        mbr = minimum_rotated_rectangle(geom)
+        coords = list(mbr.exterior.coords)
+        if len(coords) >= 4:
+            e1_len = ((coords[0][0] - coords[1][0])**2 + (coords[0][1] - coords[1][1])**2)**0.5
+            e2_len = ((coords[1][0] - coords[2][0])**2 + (coords[1][1] - coords[2][1])**2)**0.5
+            w, h = min(e1_len, e2_len), max(e1_len, e2_len)
+            
+            # Very skewed aspect ratio suggests street or angled thin lot
+            # We already have obb_aspect_ratio from features, which is L/W (always >= 1)
+            aspect_ratio = feats.get("obb_aspect_ratio", 1.0)
+            if aspect_ratio > 4.0:
+                # Find the bearing of the long edge
+                import math
+                if e1_len > e2_len:
+                    dx, dy = coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]
+                else:
+                    dx, dy = coords[2][0] - coords[1][0], coords[2][1] - coords[1][1]
+                angle_rad = math.atan2(dy, dx)
+                forced_angle = (math.degrees(angle_rad) % 90.0)
+    except Exception:
+        pass
+        
+    return eff, min_m2, forced_angle
