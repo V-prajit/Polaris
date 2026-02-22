@@ -10,7 +10,7 @@ interface ParkingScoreGaugeProps {
 
 export function ParkingScoreGauge({
     score,
-    label = "ParkIQ Score",
+    label = "Polaris Score",
     delay = 0,
 }: ParkingScoreGaugeProps) {
     const radius = 58;
@@ -18,10 +18,10 @@ export function ParkingScoreGauge({
     const strokeDashoffset = circumference - (score / 100) * circumference;
 
     const getScoreColor = (s: number) => {
-        if (s >= 75) return "hsl(142, 71%, 45%)";
-        if (s >= 50) return "hsl(187, 73%, 46%)";
-        if (s >= 25) return "hsl(38, 92%, 50%)";
-        return "hsl(0, 84%, 60%)";
+        if (s >= 75) return "#000";
+        if (s >= 50) return "#333";
+        if (s >= 25) return "#666";
+        return "#999";
     };
 
     const getGrade = (s: number) => {
@@ -51,7 +51,7 @@ export function ParkingScoreGauge({
                         cy="70"
                         r={radius}
                         fill="none"
-                        stroke="hsla(215, 25%, 20%, 0.5)"
+                        stroke="hsl(0, 0%, 92%)"
                         strokeWidth="10"
                         strokeLinecap="round"
                     />
@@ -71,9 +71,6 @@ export function ParkingScoreGauge({
                             delay: delay + 0.3,
                             duration: 1.4,
                             ease: [0.16, 1, 0.3, 1],
-                        }}
-                        style={{
-                            filter: `drop-shadow(0 0 8px ${color})`,
                         }}
                     />
                 </svg>

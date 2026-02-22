@@ -46,31 +46,17 @@ export function MetricCard({
     label,
     suffix = "",
     delay = 0,
-    color,
 }: MetricCardProps) {
     return (
         <motion.div
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay, duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-            whileHover={{ scale: 1.03, y: -2 }}
+            whileHover={{ scale: 1.02, y: -1 }}
             className="glass-panel rounded-xl p-4 flex flex-col gap-2 cursor-default group transition-all"
-            style={{
-                boxShadow: color
-                    ? `inset 0 1px 0 0 ${color}15, 0 0 0 0 transparent`
-                    : undefined,
-            }}
         >
-            <div
-                className="w-8 h-8 rounded-lg flex items-center justify-center"
-                style={{
-                    background: color ? `${color}15` : "hsla(187, 73%, 46%, 0.1)",
-                }}
-            >
-                <div
-                    style={{ color: color || "hsl(187, 73%, 46%)" }}
-                    className="opacity-80 group-hover:opacity-100 transition-opacity"
-                >
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-secondary">
+                <div className="text-muted-foreground opacity-80 group-hover:opacity-100 transition-opacity">
                     {icon}
                 </div>
             </div>

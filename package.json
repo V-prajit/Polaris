@@ -14,6 +14,7 @@
     "@radix-ui/react-tooltip": "^1.2.8",
     "@react-spring/web": "^10.0.3",
     "@types/leaflet": "^1.9.21",
+    "@untitledui/icons": "^0.0.21",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cobe": "^0.6.5",

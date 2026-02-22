@@ -13,8 +13,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ParkIQ — AI Parking Diagnostics | Powered by GrowthFactor",
+  title: "Polaris — AI Parking Diagnostics | Powered by GrowthFactor",
   description: "AI-powered parking capacity analysis using satellite imagery and SegFormer segmentation. Built for Hacklytics 2026.",
+  icons: {
+    icon: "/globe-logo.png",
+    apple: "/globe-logo.png",
+  },
 };
 
 export default function RootLayout({

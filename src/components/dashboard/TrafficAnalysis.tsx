@@ -16,15 +16,10 @@ interface TrafficAnalysisProps {
     delay?: number;
 }
 
-function Pill({ children, color }: { children: React.ReactNode; color: string }) {
+function Pill({ children }: { children: React.ReactNode }) {
     return (
         <span
-            className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider"
-            style={{
-                background: `${color}15`,
-                color: color,
-                border: `1px solid ${color}25`,
-            }}
+            className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-secondary text-foreground border border-border"
         >
             {children}
         </span>
@@ -38,28 +33,24 @@ export function TrafficAnalysis({ data, delay = 0 }: TrafficAnalysisProps) {
             label: "Avg Lanes",
             value: data.avgLanes.toFixed(1),
             sub: `max ${data.maxLanes}`,
-            color: "hsl(187, 73%, 46%)",
         },
         {
             icon: <Gauge className="w-3.5 h-3.5" />,
             label: "Speed",
             value: data.speedLimits[0] || "N/A",
             sub: data.speedLimits.length > 1 ? `+${data.speedLimits.length - 1} zones` : "",
-            color: "hsl(38, 92%, 50%)",
         },
         {
             icon: <Zap className="w-3.5 h-3.5" />,
             label: "Surface",
             value: data.surfaces[0] || "N/A",
             sub: "",
-            color: "hsl(142, 71%, 45%)",
         },
         {
             icon: <Sun className="w-3.5 h-3.5" />,
             label: "Lit",
             value: `${data.litPercentage}%`,
             sub: "of segments",
-            color: "hsl(45, 93%, 58%)",
         },
     ];
 
@@ -82,12 +73,9 @@ export function TrafficAnalysis({ data, delay = 0 }: TrafficAnalysisProps) {
                         initial={{ opacity: 0, scale: 0.9 }}
                         animate={{ opacity: 1, scale: 1 }}
                         transition={{ delay: delay + 0.2 + i * 0.1, duration: 0.4 }}
-                        className="flex items-start gap-2.5 p-2.5 rounded-lg bg-secondary/30 hover:bg-secondary/50 transition-colors"
+                        className="flex items-start gap-2.5 p-2.5 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors"
                     >
-                        <div
-                            className="w-7 h-7 rounded-md flex items-center justify-center shrink-0 mt-0.5"
-                            style={{ background: `${item.color}15`, color: item.color }}
-                        >
+                        <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0 mt-0.5 bg-secondary text-muted-foreground">
                             {item.icon}
                         </div>
                         <div className="min-w-0">
@@ -109,7 +97,7 @@ export function TrafficAnalysis({ data, delay = 0 }: TrafficAnalysisProps) {
             {data.surfaces.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 pt-1">
                     {data.surfaces.map((s) => (
-                        <Pill key={s} color="hsl(142, 71%, 45%)">
+                        <Pill key={s}>
                             {s}
                         </Pill>
                     ))}
