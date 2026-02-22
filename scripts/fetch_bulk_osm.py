@@ -1,11 +1,12 @@
 import requests
 import os
+import time
 
 os.makedirs('cache', exist_ok=True)
 overpass_url = 'https://overpass-api.de/api/interpreter'
 
-print('Fetching surface parking...')
-query = """
+queries = {
+    "surface": """
 [out:json][timeout:300];
 (
   way["amenity"="parking"](33.647,-84.552,33.886,-84.289);
@@ -14,14 +15,8 @@ query = """
 out body;
 >;
 out skel qt;
-"""
-r = requests.post(overpass_url, data={'data': query}, timeout=300)
-print(f'Surface: {r.status_code}, {len(r.content)} bytes')
-with open('cache/surface_raw.json', 'w') as f:
-    f.write(r.text)
-
-print('Fetching structured parking...')
-query2 = """
+""",
+    "structured": """
 [out:json][timeout:300];
 (
   way["building"="parking"](33.647,-84.552,33.886,-84.289);
@@ -33,14 +28,8 @@ query2 = """
 out body;
 >;
 out skel qt;
-"""
-r2 = requests.post(overpass_url, data={'data': query2}, timeout=300)
-print(f'Structured: {r2.status_code}, {len(r2.content)} bytes')
-with open('cache/structured_raw.json', 'w') as f:
-    f.write(r2.text)
-
-print('Fetching street parking...')
-query3 = """
+""",
+    "street": """
 [out:json][timeout:300];
 (
   way["parking:lane"](33.647,-84.552,33.886,-84.289);
@@ -51,10 +40,31 @@ query3 = """
 out body;
 >;
 out skel qt;
-"""
-r3 = requests.post(overpass_url, data={'data': query3}, timeout=300)
-print(f'Street: {r3.status_code}, {len(r3.content)} bytes')
-with open('cache/street_raw.json', 'w') as f:
-    f.write(r3.text)
+""",
+}
 
-print('Done! Raw JSON saved to cache/')
+for name, query in queries.items():
+    out_path = f"cache/{name}_raw.json"
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
+        print(f"Skipping {name} — already have {os.path.getsize(out_path)} bytes")
+        continue
+
+    for attempt in range(3):
+        print(f"Fetching {name} (attempt {attempt+1})...")
+        try:
+            r = requests.post(overpass_url, data={'data': query}, timeout=300)
+            if r.status_code == 200 and len(r.content) > 50:
+                with open(out_path, 'w') as f:
+                    f.write(r.text)
+                print(f"  {name}: {len(r.content)} bytes")
+                break
+            else:
+                print(f"  {name}: HTTP {r.status_code}, {len(r.content)} bytes — retrying in 30s")
+                time.sleep(30)
+        except Exception as e:
+            print(f"  {name}: error {e} — retrying in 30s")
+            time.sleep(30)
+    else:
+        print(f"  {name}: FAILED after 3 attempts")
+
+print("Done!")
