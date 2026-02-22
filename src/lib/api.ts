@@ -35,6 +35,11 @@ export interface ParkingFeature {
     floor_area_m2?: number;
     length_m?: number;
     sides?: number;
+    // Detection overlay fields — only present on surface features when ML models ran
+    car_boxes?: { bbox: [number, number, number, number]; conf: number }[];
+    spot_boxes?: { bbox: [number, number, number, number]; conf: number }[];
+    segformer_contours?: GeoJSON.Geometry;
+    tile_bounds?: [number, number, number, number];
 }
 
 export interface EstimateResponse {
@@ -179,6 +184,86 @@ export function apiResponseToGeoJSON(
     }));
 
     return { type: "FeatureCollection", features };
+}
+
+/**
+ * Convert a bounding box [lat1, lon1, lat2, lon2] into a closed GeoJSON Polygon ring.
+ * GeoJSON uses [lon, lat] axis order.
+ */
+function bboxToPolygon(bbox: [number, number, number, number]): GeoJSON.Polygon {
+    const [lat1, lon1, lat2, lon2] = bbox;
+    return {
+        type: "Polygon",
+        coordinates: [[
+            [lon1, lat1],
+            [lon2, lat1],
+            [lon2, lat2],
+            [lon1, lat2],
+            [lon1, lat1],
+        ]],
+    };
+}
+
+export interface OverlayData {
+    carBoxes: GeoJSON.FeatureCollection;
+    spotBoxes: GeoJSON.FeatureCollection;
+    segformerMasks: GeoJSON.FeatureCollection;
+}
+
+/**
+ * Extract ML detection overlays from an EstimateResponse into three separate
+ * GeoJSON FeatureCollections that MapView can render as distinct layers.
+ *
+ * - carBoxes:       red bounding-box rectangles from YOLO car detection
+ * - spotBoxes:      green bounding-box rectangles from YOLO spot detection
+ * - segformerMasks: purple polygons from Segformer semantic segmentation
+ *
+ * Overlay fields are optional — collections will simply have zero features
+ * when precomputed files were built without running the ML pipeline.
+ */
+export function extractOverlayData(data: EstimateResponse): OverlayData {
+    const carFeatures: GeoJSON.Feature[] = [];
+    const spotFeatures: GeoJSON.Feature[] = [];
+    const segformerFeatures: GeoJSON.Feature[] = [];
+
+    for (const feature of data.surface.features) {
+        // Car bounding boxes
+        if (feature.car_boxes && feature.car_boxes.length > 0) {
+            for (const box of feature.car_boxes) {
+                carFeatures.push({
+                    type: "Feature",
+                    properties: { overlayType: "car", conf: box.conf },
+                    geometry: bboxToPolygon(box.bbox),
+                });
+            }
+        }
+
+        // Parking spot bounding boxes
+        if (feature.spot_boxes && feature.spot_boxes.length > 0) {
+            for (const box of feature.spot_boxes) {
+                spotFeatures.push({
+                    type: "Feature",
+                    properties: { overlayType: "spot", conf: box.conf },
+                    geometry: bboxToPolygon(box.bbox),
+                });
+            }
+        }
+
+        // Segformer mask contours (already a GeoJSON geometry, typically MultiPolygon)
+        if (feature.segformer_contours) {
+            segformerFeatures.push({
+                type: "Feature",
+                properties: { overlayType: "segformer", name: feature.name },
+                geometry: feature.segformer_contours,
+            });
+        }
+    }
+
+    return {
+        carBoxes: { type: "FeatureCollection", features: carFeatures },
+        spotBoxes: { type: "FeatureCollection", features: spotFeatures },
+        segformerMasks: { type: "FeatureCollection", features: segformerFeatures },
+    };
 }
 
 /**

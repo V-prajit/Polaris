@@ -426,6 +426,48 @@ class ParkingSegmenter:
             cc_count=cc_count,
         )
 
+    def segment_to_contours(
+        self,
+        pil_image: Image.Image,
+        min_area: int = 200,
+    ) -> list:
+        """Segment the image and return parking-region contours as pixel arrays.
+
+        Runs the full segmentation pipeline and extracts contours from the
+        resulting binary mask using OpenCV.  Contours smaller than *min_area*
+        pixels are discarded as noise.
+
+        Parameters
+        ----------
+        pil_image : PIL.Image.Image
+            RGB satellite tile.
+        min_area : int
+            Minimum contour area in pixels to include (default 200).
+
+        Returns
+        -------
+        list of numpy.ndarray
+            Each array has shape ``(N, 2)`` with columns ``[x, y]`` in pixel
+            coordinates (origin = top-left corner of the tile).
+        """
+        mask = self.segment(pil_image)
+
+        # findContours expects uint8; mask from segment() is already uint8
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        result = []
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+            # contour shape is (N, 1, 2) — squeeze to (N, 2) for convenience
+            result.append(contour.reshape(-1, 2))
+
+        return result
+
     # ── Visualisation ──────────────────────────────────────────────
 
     @staticmethod

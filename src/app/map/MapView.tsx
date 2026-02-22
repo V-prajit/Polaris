@@ -54,6 +54,11 @@ interface MapViewProps {
   radius: number;
   layers: Record<string, boolean>;
   geojsonData: GeoJSON.FeatureCollection | null;
+  // ML detection overlay layers — all optional; absent when no ML data exists
+  carBoxes?: GeoJSON.FeatureCollection | null;
+  spotBoxes?: GeoJSON.FeatureCollection | null;
+  segformerMasks?: GeoJSON.FeatureCollection | null;
+  polarisResults?: GeoJSON.FeatureCollection | null;
 }
 
 // Helper component to recenter map when props change
@@ -145,7 +150,37 @@ function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string,
   }
 }
 
-export default function MapView({ lat, lng, radius, layers, geojsonData }: MapViewProps) {
+// ─── Overlay layer styles ────────────────────────────────────────────
+
+const carBoxStyle = {
+  color: "#ef4444",
+  weight: 1.5,
+  fillColor: "rgba(239, 68, 68, 0.25)",
+  fillOpacity: 0.25,
+};
+
+const spotBoxStyle = {
+  color: "#22c55e",
+  weight: 1.5,
+  fillColor: "rgba(34, 197, 94, 0.25)",
+  fillOpacity: 0.25,
+};
+
+const segformerStyle = {
+  color: "#a855f7",
+  weight: 1.5,
+  fillColor: "rgba(168, 85, 247, 0.25)",
+  fillOpacity: 0.25,
+};
+
+const polarisHexStyle = {
+  color: "#14b8a6",
+  weight: 1.5,
+  fillColor: "rgba(20, 184, 166, 0.20)",
+  fillOpacity: 0.20,
+};
+
+export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxes, spotBoxes, segformerMasks, polarisResults }: MapViewProps) {
   const data = geojsonData;
 
   const center = useMemo<[number, number]>(() => [lat, lng], [lat, lng]);
@@ -217,6 +252,68 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
       });
     }
   }, [layers]);
+
+  // ─── Overlay onEachFeature callbacks ──────────────────────────────
+
+  const onEachCar = useCallback((feature: any, layer: any) => {
+    const conf = feature.properties?.conf != null
+      ? (feature.properties.conf as number).toFixed(2)
+      : "—";
+    layer.bindTooltip(`<div class="tooltip-title">Car</div><div class="tooltip-row"><span class="tooltip-label">Confidence</span><span class="tooltip-value" style="color:#ef4444;font-weight:700;">${conf}</span></div>`, {
+      sticky: true,
+      className: "parking-tooltip",
+      direction: "top",
+      offset: [0, -6],
+    });
+    layer.on("mouseover", () => layer.setStyle({ ...carBoxStyle, weight: 2.5, fillOpacity: 0.45 }));
+    layer.on("mouseout", () => layer.setStyle(carBoxStyle));
+  }, []);
+
+  const onEachSpot = useCallback((feature: any, layer: any) => {
+    const conf = feature.properties?.conf != null
+      ? (feature.properties.conf as number).toFixed(2)
+      : "—";
+    layer.bindTooltip(`<div class="tooltip-title">Parking Spot</div><div class="tooltip-row"><span class="tooltip-label">Confidence</span><span class="tooltip-value" style="color:#22c55e;font-weight:700;">${conf}</span></div>`, {
+      sticky: true,
+      className: "parking-tooltip",
+      direction: "top",
+      offset: [0, -6],
+    });
+    layer.on("mouseover", () => layer.setStyle({ ...spotBoxStyle, weight: 2.5, fillOpacity: 0.45 }));
+    layer.on("mouseout", () => layer.setStyle(spotBoxStyle));
+  }, []);
+
+  const onEachSegformer = useCallback((feature: any, layer: any) => {
+    const name = feature.properties?.name || "Segformer Mask";
+    layer.bindTooltip(`<div class="tooltip-title">Segformer Mask</div><div class="tooltip-row"><span class="tooltip-label">Area</span><span class="tooltip-value">${name}</span></div>`, {
+      sticky: true,
+      className: "parking-tooltip",
+      direction: "top",
+      offset: [0, -6],
+    });
+    layer.on("mouseover", () => layer.setStyle({ ...segformerStyle, weight: 2.5, fillOpacity: 0.45 }));
+    layer.on("mouseout", () => layer.setStyle(segformerStyle));
+  }, []);
+
+  const onEachPolaris = useCallback((feature: any, layer: any) => {
+    const p = feature.properties || {};
+    const hexId = p.hex_id || "Hex Cell";
+    const totalSpots = p.total_spots != null ? p.total_spots : "—";
+    const densityClass = p.density_class ? `<div class="tooltip-row"><span class="tooltip-label">Density</span><span class="tooltip-value">${p.density_class}</span></div>` : "";
+    const poi = p.poi_summary ? `<div class="tooltip-row"><span class="tooltip-label">POIs</span><span class="tooltip-value">${p.poi_summary}</span></div>` : "";
+    layer.bindTooltip(`
+      <div class="tooltip-title">${hexId}</div>
+      <div class="tooltip-row"><span class="tooltip-label">Total Spots</span><span class="tooltip-value" style="color:#14b8a6;font-weight:700;">${totalSpots}</span></div>
+      ${densityClass}${poi}
+    `, {
+      sticky: true,
+      className: "parking-tooltip",
+      direction: "top",
+      offset: [0, -6],
+    });
+    layer.on("mouseover", () => layer.setStyle({ ...polarisHexStyle, weight: 2.5, fillOpacity: 0.40 }));
+    layer.on("mouseout", () => layer.setStyle(polarisHexStyle));
+  }, []);
 
   return (
     <div className="h-full w-full relative">
@@ -317,6 +414,46 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
             data={roadData}
             style={featureStyle}
             onEachFeature={onEachRoad}
+          />
+        )}
+
+        {/* YOLO Car Boxes — red semi-transparent rectangles */}
+        {layers.model_yolo && carBoxes && carBoxes.features.length > 0 && (
+          <GeoJSON
+            key={"car-boxes-" + carBoxes.features.length}
+            data={carBoxes}
+            style={() => carBoxStyle}
+            onEachFeature={onEachCar}
+          />
+        )}
+
+        {/* YOLO Spot Boxes — green semi-transparent rectangles */}
+        {layers.model_yolo && spotBoxes && spotBoxes.features.length > 0 && (
+          <GeoJSON
+            key={"spot-boxes-" + spotBoxes.features.length}
+            data={spotBoxes}
+            style={() => spotBoxStyle}
+            onEachFeature={onEachSpot}
+          />
+        )}
+
+        {/* Segformer Masks — purple semi-transparent polygons */}
+        {layers.model_segformer && segformerMasks && segformerMasks.features.length > 0 && (
+          <GeoJSON
+            key={"segformer-" + segformerMasks.features.length}
+            data={segformerMasks}
+            style={() => segformerStyle}
+            onEachFeature={onEachSegformer}
+          />
+        )}
+
+        {/* Polaris Search Results — teal hex cell polygons */}
+        {polarisResults && polarisResults.features.length > 0 && (
+          <GeoJSON
+            key={"polaris-" + polarisResults.features.length}
+            data={polarisResults}
+            style={() => polarisHexStyle}
+            onEachFeature={onEachPolaris}
           />
         )}
       </MapContainer>

@@ -165,6 +165,123 @@ def _sanitize_dict(d):
     return d
 
 
+def _pixel_boxes_to_wgs84(boxes_pixel, geom_3857, img_size, padding_pct=0.10):
+    """Convert pixel-space bounding boxes to WGS84 lat/lon rectangles.
+
+    Parameters
+    ----------
+    boxes_pixel : list of (x1, y1, x2, y2, conf)
+        Detection boxes in pixel coordinates (origin = top-left).
+    geom_3857 : shapely geometry
+        OSM feature geometry in EPSG:3857 (used to derive tile extents).
+    img_size : (width, height)
+        Pixel dimensions of the satellite tile (PIL Image.size).
+    padding_pct : float
+        Padding fraction applied when fetching the tile (default 0.10 = 10 %).
+
+    Returns
+    -------
+    list of {"bbox": [lat1, lon1, lat2, lon2], "conf": float}
+        Each dict represents one detection box in WGS84 degrees.
+        lat1/lon1 = south-west corner, lat2/lon2 = north-east corner.
+    """
+    if not boxes_pixel:
+        return []
+
+    import pyproj
+
+    minx, miny, maxx, maxy = geom_3857.bounds
+    width = maxx - minx
+    height = maxy - miny
+    pad_x = width * padding_pct
+    pad_y = height * padding_pct
+    tile_minx = minx - pad_x
+    tile_miny = miny - pad_y
+    tile_maxx = maxx + pad_x
+    tile_maxy = maxy + pad_y
+    img_w, img_h = img_size
+    m_per_px_x = (tile_maxx - tile_minx) / img_w
+    m_per_px_y = (tile_maxy - tile_miny) / img_h
+
+    transformer = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+    wgs84_boxes = []
+    for x1, y1, x2, y2, conf in boxes_pixel:
+        # pixel → EPSG:3857
+        geo_x1 = tile_minx + x1 * m_per_px_x
+        geo_x2 = tile_minx + x2 * m_per_px_x
+        # y-axis is flipped: pixel y=0 is at the top (north) of the tile
+        geo_y1 = tile_maxy - y2 * m_per_px_y   # south edge of box
+        geo_y2 = tile_maxy - y1 * m_per_px_y   # north edge of box
+        # EPSG:3857 → WGS84 (lon, lat order with always_xy=True)
+        lon1, lat1 = transformer.transform(geo_x1, geo_y1)   # SW corner
+        lon2, lat2 = transformer.transform(geo_x2, geo_y2)   # NE corner
+        wgs84_boxes.append({"bbox": [lat1, lon1, lat2, lon2], "conf": round(float(conf), 3)})
+    return wgs84_boxes
+
+
+def _pixel_contours_to_wgs84(contours, geom_3857, img_size, padding_pct=0.10):
+    """Convert pixel-space contours to a WGS84 GeoJSON MultiPolygon.
+
+    Parameters
+    ----------
+    contours : list of numpy.ndarray
+        Each array is shape (N, 2) with columns [x, y] in pixel coords,
+        as returned by ParkingSegmenter.segment_to_contours().
+    geom_3857 : shapely geometry
+        OSM feature geometry in EPSG:3857.
+    img_size : (width, height)
+        Pixel dimensions of the satellite tile.
+    padding_pct : float
+        Padding fraction used when the tile was fetched.
+
+    Returns
+    -------
+    dict or None
+        GeoJSON geometry dict of type "MultiPolygon", or *None* if no
+        contours survive the conversion (e.g. all have fewer than 3 points).
+    """
+    if not contours:
+        return None
+
+    import pyproj
+
+    minx, miny, maxx, maxy = geom_3857.bounds
+    width = maxx - minx
+    height = maxy - miny
+    pad_x = width * padding_pct
+    pad_y = height * padding_pct
+    tile_minx = minx - pad_x
+    tile_miny = miny - pad_y
+    tile_maxx = maxx + pad_x
+    tile_maxy = maxy + pad_y
+    img_w, img_h = img_size
+    m_per_px_x = (tile_maxx - tile_minx) / img_w
+    m_per_px_y = (tile_maxy - tile_miny) / img_h
+
+    transformer = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+    polygons = []
+    for contour in contours:
+        if len(contour) < 3:
+            continue
+        ring = []
+        for pt in contour:
+            x, y = float(pt[0]), float(pt[1])
+            geo_x = tile_minx + x * m_per_px_x
+            geo_y = tile_maxy - y * m_per_px_y
+            lon, lat = transformer.transform(geo_x, geo_y)
+            ring.append([lon, lat])
+        # GeoJSON rings must be closed
+        ring.append(ring[0])
+        polygons.append([ring])
+
+    if not polygons:
+        return None
+
+    return {"type": "MultiPolygon", "coordinates": polygons}
+
+
 def _run_surface_detection(gdf_3857):
     """Run two-stage pipeline on surface lots: SegFormer mask → YOLO detect + car count."""
     detector = _get_detector()
@@ -188,6 +305,12 @@ def _run_surface_detection(gdf_3857):
         cars = 0
         spot_method = "area"
 
+        # Overlay data — populated only for Polygon features that go through imagery
+        spot_boxes = []       # list of (x1,y1,x2,y2,conf) pixel tuples
+        car_boxes = []        # list of (x1,y1,x2,y2,conf) pixel tuples
+        seg_contours = []     # list of (N,2) numpy arrays
+        img = None            # set below when a tile is fetched
+
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             img = get_satellite_tile(geom)
 
@@ -203,12 +326,14 @@ def _run_surface_detection(gdf_3857):
                     seg_mask = segmenter.segment(img)
                     result = segmenter.count_spots(img)
                     count_segformer = result.count
+                    # Extract contours from the same mask for the overlay
+                    seg_contours = segmenter.segment_to_contours(img)
                 except Exception as e:
                     logger.warning("SegFormer failed for feature %s: %s", idx, e)
 
             # Stage 2: YOLO spot detection (with optional mask filtering)
             if detector is not None:
-                count_yolo = detector.count_spots(
+                count_yolo, spot_boxes = detector.count_spots_with_boxes(
                     img, geom, osm_tags=tags, segformer_mask=seg_mask
                 )
                 spot_method = "yolo_detect" if detector.count_mode == "detect" else "segformer"
@@ -223,7 +348,9 @@ def _run_surface_detection(gdf_3857):
             # Stage 3: Car counting (COCO-pretrained YOLO)
             if car_detector is not None:
                 try:
-                    cars = car_detector.count_cars(img, segformer_mask=seg_mask)
+                    cars, car_boxes = car_detector.count_cars_with_boxes(
+                        img, segformer_mask=seg_mask
+                    )
                 except Exception as e:
                     logger.warning("Car counting failed for feature %s: %s", idx, e)
 
@@ -244,6 +371,20 @@ def _run_surface_detection(gdf_3857):
         geom_wgs = gpd.GeoSeries([geom], crs=3857).to_crs(4326).iloc[0]
         centroid_wgs = geom_wgs.centroid
 
+        # Derive tile_bounds from the WGS84 geometry extents [S, W, N, E]
+        tb = geom_wgs.bounds  # (minx=west, miny=south, maxx=east, maxy=north)
+        tile_bounds = [tb[1], tb[0], tb[3], tb[2]]
+
+        # Convert pixel-space overlay data to WGS84 (only when we have imagery)
+        spot_boxes_wgs84 = []
+        car_boxes_wgs84 = []
+        segformer_contours_wgs84 = None
+        if img is not None:
+            img_size = img.size
+            spot_boxes_wgs84 = _pixel_boxes_to_wgs84(spot_boxes, geom, img_size)
+            car_boxes_wgs84 = _pixel_boxes_to_wgs84(car_boxes, geom, img_size)
+            segformer_contours_wgs84 = _pixel_contours_to_wgs84(seg_contours, geom, img_size)
+
         results.append({
             "name": tags.get("name", f"Surface #{idx}"),
             "type": "surface",
@@ -256,6 +397,11 @@ def _run_surface_detection(gdf_3857):
             "utilization": utilization,
             "centroid": [centroid_wgs.y, centroid_wgs.x],
             "geometry": _geometry_to_coords(geom_wgs),
+            # Detection overlay data (new fields — backwards-compatible additions)
+            "spot_boxes": spot_boxes_wgs84,
+            "car_boxes": car_boxes_wgs84,
+            "segformer_contours": segformer_contours_wgs84,
+            "tile_bounds": tile_bounds,
         })
 
     return results
