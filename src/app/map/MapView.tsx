@@ -70,28 +70,51 @@ function MapUpdater({ center }: { center: [number, number] }) {
   return null;
 }
 
-// ─── Per-feature styling (colored by type) ──────────────────────────
-function featureStyle(feature: any) {
-  const fType = feature?.properties?.featureType || feature?.properties?.parking || "default";
-  const isStreet = feature?.properties?.highway || fType === "street";
-  const colors = getFeatureColor(isStreet ? "street" : fType);
+// ─── Model-aware color overrides ────────────────────────────────────
+const MODEL_COLORS: Record<string, { fill: string; stroke: string }> = {
+  model_yolo: { fill: "rgba(34, 197, 94, 0.30)", stroke: "#22c55e" },       // green
+  model_segformer: { fill: "rgba(168, 85, 247, 0.30)", stroke: "#a855f7" },  // purple
+  model_area: { fill: "rgba(239, 68, 68, 0.25)", stroke: "#ef4444" },        // red (default)
+};
 
-  if (isStreet) {
+// ─── Per-feature styling (colored by type + active model) ───────────
+function makeFeatureStyle(layers: Record<string, boolean>) {
+  const activeModel = layers.model_yolo ? "model_yolo" : layers.model_segformer ? "model_segformer" : "model_area";
+  const modelColors = MODEL_COLORS[activeModel];
+
+  return (feature: any) => {
+    const fType = feature?.properties?.featureType || feature?.properties?.parking || "default";
+    const isStreet = feature?.properties?.highway || fType === "street";
+    const colors = getFeatureColor(isStreet ? "street" : fType);
+
+    if (isStreet) {
+      return {
+        color: colors.stroke,
+        weight: 4,
+        fillOpacity: 0,
+        dashArray: undefined as string | undefined,
+        opacity: 0.8,
+      };
+    }
+
+    // Surface lots use the active model's color scheme
+    if (fType === "surface") {
+      return {
+        color: modelColors.stroke,
+        weight: 2,
+        fillColor: modelColors.fill,
+        fillOpacity: 0.30,
+        dashArray: undefined as string | undefined,
+      };
+    }
+
     return {
       color: colors.stroke,
-      weight: 4,
-      fillOpacity: 0,
+      weight: 2,
+      fillColor: colors.fill,
+      fillOpacity: 0.25,
       dashArray: undefined as string | undefined,
-      opacity: 0.8,
     };
-  }
-
-  return {
-    color: colors.stroke,
-    weight: 2,
-    fillColor: colors.fill,
-    fillOpacity: 0.25,
-    dashArray: undefined as string | undefined,
   };
 }
 
@@ -184,6 +207,8 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
   const data = geojsonData;
 
   const center = useMemo<[number, number]>(() => [lat, lng], [lat, lng]);
+  const modelKey = layers.model_yolo ? "yolo" : layers.model_segformer ? "segformer" : "area";
+  const featureStyle = useMemo(() => makeFeatureStyle(layers), [layers]);
 
   // Separate parking and road features
   const parkingData = useMemo(() => {
@@ -400,7 +425,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
         {/* Parking Zones — colored fills */}
         {layers.parking && parkingData && parkingData.features.length > 0 && (
           <GeoJSON
-            key={"parking-" + parkingData.features.length}
+            key={"parking-" + parkingData.features.length + "-" + modelKey}
             data={parkingData}
             style={featureStyle}
             onEachFeature={onEachParking}

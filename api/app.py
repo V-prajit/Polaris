@@ -429,7 +429,7 @@ ATLANTA_POLARIS_BBOX = {
     "max_lat": 33.886,
     "min_lon": -84.552,
     "max_lon": -84.289,
-    "resolution": 9,
+    "resolution": 7,
 }
 
 def _estimate_cache_key(lat: float, lon: float, radius: int):
@@ -574,7 +574,7 @@ def macro(
     
     # 2. fill with h3 hexagons
     hexagons = list(h3.polygon_to_cells(poly, res=resolution))
-    if len(hexagons) > 200:
+    if len(hexagons) > 10000:
         return {"error": f"Bounding box too large for resolution {resolution}. Trying to generate {len(hexagons)} cells (max 200). Reduce resolution or shrink bounding box.", "status": 400}
     
     grid_features = []
