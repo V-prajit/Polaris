@@ -522,6 +522,49 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
+    # ── Step 2b: Check for polygon features; create synthetic if none ──────
+    import geopandas as gpd
+    from shapely.geometry import Point
+    import pyproj
+
+    has_polygons = False
+    if gdf is not None and not gdf.empty:
+        gdf_3857_check = gdf.to_crs(epsg=3857)
+        polygon_mask = gdf_3857_check.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+        has_polygons = polygon_mask.any()
+        print(f"  Polygon/MultiPolygon features in OSM: {polygon_mask.sum()}")
+
+    if not has_polygons:
+        print(f"\n  *** No surface parking polygons in OSM at this location ***")
+        print(f"  Creating synthetic scan polygon ({TARGET_RADIUS}m radius) for YOLO detection ...")
+
+        # Convert lat/lon to EPSG:3857 meters
+        transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        cx, cy = transformer.transform(TARGET_LON, TARGET_LAT)
+        synthetic_geom = Point(cx, cy).buffer(TARGET_RADIUS)  # circle in meters
+
+        # Build a minimal GeoDataFrame with the synthetic polygon
+        synthetic_gdf = gpd.GeoDataFrame(
+            [{"name": f"Scan Area ({TARGET_LAT}, {TARGET_LON})", "amenity": "parking", "parking": "surface"}],
+            geometry=[synthetic_geom],
+            crs="EPSG:3857",
+        )
+
+        if gdf is not None and not gdf.empty:
+            # Merge: keep original features AND add synthetic polygon
+            gdf_3857_orig = gdf.to_crs(epsg=3857)
+            import pandas as pd
+            gdf = pd.concat([gdf_3857_orig, synthetic_gdf], ignore_index=True)
+            gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs="EPSG:3857")
+        else:
+            gdf = synthetic_gdf
+
+        print(f"  Synthetic polygon added. Total features: {len(gdf)}")
+        # Mark that gdf is already in EPSG:3857
+        _gdf_already_3857 = True
+    else:
+        _gdf_already_3857 = False
+
     # ── Step 3: Surface detection pipeline ──────────────────────────────────
     print("\n[3/5] Running surface detection pipeline ...")
     surface_features = []
@@ -529,7 +572,7 @@ def main():
 
     if gdf is not None and not gdf.empty:
         try:
-            gdf_3857 = gdf.to_crs(epsg=3857)
+            gdf_3857 = gdf if _gdf_already_3857 else gdf.to_crs(epsg=3857)
             surface_features = run_surface_detection_with_overlays(
                 gdf_3857, detector, segmenter, car_detector
             )

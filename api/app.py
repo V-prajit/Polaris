@@ -451,8 +451,35 @@ def estimate(
     surface_features = []
     surface_total = 0
 
+    # Check if OSM returned any polygon features (surface parking lots)
+    has_polygons = False
+    gdf_3857 = None
     if gdf is not None and not gdf.empty:
         gdf_3857 = gdf.to_crs(epsg=3857)
+        has_polygons = gdf_3857.geometry.geom_type.isin(["Polygon", "MultiPolygon"]).any()
+
+    if not has_polygons:
+        # No surface parking polygons in OSM — create a synthetic scan polygon
+        # so YOLO can still detect cars/spots from satellite imagery
+        import pyproj
+        from shapely.geometry import Point as ShapelyPoint
+        transformer_to_3857 = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        cx, cy = transformer_to_3857.transform(lon, lat)
+        synthetic_geom = ShapelyPoint(cx, cy).buffer(radius)
+        synthetic_gdf = gpd.GeoDataFrame(
+            [{"name": f"Scan Area ({lat}, {lon})", "amenity": "parking", "parking": "surface"}],
+            geometry=[synthetic_geom],
+            crs="EPSG:3857",
+        )
+        if gdf is not None and not gdf.empty:
+            import pandas as pd
+            gdf_3857 = pd.concat([gdf_3857, synthetic_gdf], ignore_index=True)
+            gdf_3857 = gpd.GeoDataFrame(gdf_3857, geometry="geometry", crs="EPSG:3857")
+        else:
+            gdf_3857 = synthetic_gdf
+        logger.info(f"Created synthetic scan polygon for ({lat}, {lon}, {radius}m)")
+
+    if gdf_3857 is not None and not gdf_3857.empty:
         surface_features = _run_surface_detection(gdf_3857)
         surface_total = sum(f["count"] for f in surface_features)
 
