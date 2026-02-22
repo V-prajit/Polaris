@@ -65,7 +65,7 @@ interface MapViewProps {
 function MapUpdater({ center }: { center: [number, number] }) {
   const map = useMap();
   useEffect(() => {
-    map.setView(center, map.getZoom());
+    map.setView(center, 19);
   }, [center, map]);
   return null;
 }
@@ -386,7 +386,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData, carBoxe
 
       <MapContainer
         center={center}
-        zoom={17}
+        zoom={19}
         style={{ height: "100%", width: "100%" }}
         zoomControl={false}
         attributionControl={false}
