@@ -177,36 +177,43 @@ def _run_surface_detection(gdf_3857):
             continue
 
         count = 0
+        count_area = 0
+        count_yolo = 0
+        count_segformer = 0
         cars = 0
         spot_method = "area"
 
         if geom.geom_type in ("Polygon", "MultiPolygon"):
             img = get_satellite_tile(geom)
 
+            from parksight import config as _cfg
+            stall_area = _cfg["STALL_AREA_M2"]
+            usable = _cfg["USABLE_FRACTION_SURFACE"]
+            count_area = int((geom.area / stall_area) * usable)
+
             # Stage 1: SegFormer lot mask (optional)
             seg_mask = None
             if segmenter is not None:
                 try:
                     seg_mask = segmenter.segment(img)
+                    result = segmenter.count_spots(img)
+                    count_segformer = result.count
                 except Exception as e:
                     logger.warning("SegFormer failed for feature %s: %s", idx, e)
 
             # Stage 2: YOLO spot detection (with optional mask filtering)
             if detector is not None:
-                count = detector.count_spots(
+                count_yolo = detector.count_spots(
                     img, geom, osm_tags=tags, segformer_mask=seg_mask
                 )
                 spot_method = "yolo_detect" if detector.count_mode == "detect" else "segformer"
+                count = count_yolo
             elif seg_mask is not None:
-                result = segmenter.count_spots(img)
-                count = result.count
-                spot_method = result.method
+                spot_method = "segformer"
+                count = count_segformer
             else:
-                from parksight import config as _cfg
-                stall_area = _cfg["STALL_AREA_M2"]
-                usable = _cfg["USABLE_FRACTION_SURFACE"]
-                count = int((geom.area / stall_area) * usable)
                 spot_method = "area"
+                count = count_area
 
             # Stage 3: Car counting (COCO-pretrained YOLO)
             if car_detector is not None:
@@ -217,9 +224,10 @@ def _run_surface_detection(gdf_3857):
 
         elif geom.geom_type in ("LineString", "MultiLineString"):
             count = get_line_count(geom)
+            count_area = count
             spot_method = "street"
 
-        if count <= 0:
+        if count <= 0 and count_area <= 0:
             continue
 
         # confidence bands
@@ -235,6 +243,9 @@ def _run_surface_detection(gdf_3857):
             "name": tags.get("name", f"Surface #{idx}"),
             "type": "surface",
             "count": count,
+            "count_area": count_area,
+            "count_yolo": count_yolo,
+            "count_segformer": count_segformer,
             "spots": spot_band.to_dict(),
             "cars": car_band.to_dict(),
             "utilization": utilization,

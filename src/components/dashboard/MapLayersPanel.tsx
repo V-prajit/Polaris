@@ -10,6 +10,7 @@ interface LayerToggle {
     icon: React.ReactNode;
     defaultOn: boolean;
     count?: number;
+    radioGroup?: string;
 }
 
 interface MapLayersPanelProps {
@@ -18,6 +19,14 @@ interface MapLayersPanelProps {
 }
 
 const LAYER_GROUPS: { title: string; layers: LayerToggle[] }[] = [
+    {
+        title: "MODEL OVERLAYS",
+        layers: [
+            { id: "model_area", label: "Math Heuristics", icon: <Layers className="w-3.5 h-3.5" />, defaultOn: true, radioGroup: "model" },
+            { id: "model_yolo", label: "YOLO V11", icon: <Eye className="w-3.5 h-3.5" />, defaultOn: false, radioGroup: "model" },
+            { id: "model_segformer", label: "Segformer", icon: <Layers className="w-3.5 h-3.5" />, defaultOn: false, radioGroup: "model" },
+        ],
+    },
     {
         title: "ANALYSIS",
         layers: [
@@ -47,10 +56,28 @@ export function MapLayersPanel({ onToggle, delay = 0 }: MapLayersPanelProps) {
         return state;
     });
 
-    const toggle = (id: string) => {
-        const next = !layerState[id];
-        setLayerState((s) => ({ ...s, [id]: next }));
-        onToggle(id, next);
+    const toggle = (id: string, radioGroup?: string) => {
+        setLayerState((s) => {
+            const nextState = { ...s };
+            if (radioGroup) {
+                // If it's a radio group, turn off all others in the group and turn this one on
+                LAYER_GROUPS.forEach(g => {
+                    g.layers.forEach(l => {
+                        if (l.radioGroup === radioGroup) {
+                            const isTarget = l.id === id;
+                            if (nextState[l.id] !== isTarget) {
+                                nextState[l.id] = isTarget;
+                                onToggle(l.id, isTarget);
+                            }
+                        }
+                    });
+                });
+            } else {
+                nextState[id] = !s[id];
+                onToggle(id, nextState[id]);
+            }
+            return nextState;
+        });
     };
 
     return (
@@ -97,10 +124,10 @@ export function MapLayersPanel({ onToggle, delay = 0 }: MapLayersPanelProps) {
                                     return (
                                         <button
                                             key={layer.id}
-                                            onClick={() => toggle(layer.id)}
+                                            onClick={() => toggle(layer.id, layer.radioGroup)}
                                             className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-xs transition-all ${on
-                                                    ? "bg-primary/10 text-foreground"
-                                                    : "text-muted-foreground hover:bg-secondary/30"
+                                                ? "bg-primary/10 text-foreground"
+                                                : "text-muted-foreground hover:bg-secondary/30"
                                                 }`}
                                         >
                                             <span

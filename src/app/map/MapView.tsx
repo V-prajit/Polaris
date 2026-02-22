@@ -90,10 +90,27 @@ function featureStyle(feature: any) {
   };
 }
 
-function buildTooltipHTML(props: any, isParking: boolean): string {
+function buildTooltipHTML(props: any, isParking: boolean, layers: Record<string, boolean>): string {
   const fType = props.featureType || props.parking || "surface";
   const typeLabel = fType.charAt(0).toUpperCase() + fType.slice(1);
   const accentColor = getFeatureColor(fType).stroke;
+
+  // Determine which count to show based on active toggle
+  let displayCount = props.count; // Default fallback
+  let displayMethod = "Est. Stalls";
+
+  if (isParking && fType === "surface") {
+    if (layers.model_segformer && props.count_segformer !== undefined) {
+      displayCount = props.count_segformer;
+      displayMethod = "Segformer Est.";
+    } else if (layers.model_yolo && props.count_yolo !== undefined) {
+      displayCount = props.count_yolo;
+      displayMethod = "YOLO V11 Est.";
+    } else if (props.count_area !== undefined) {
+      displayCount = props.count_area;
+      displayMethod = "Math Heuristics";
+    }
+  }
 
   if (isParking) {
     return `
@@ -103,8 +120,8 @@ function buildTooltipHTML(props: any, isParking: boolean): string {
         <span class="tooltip-value">${typeLabel}</span>
       </div>
       <div class="tooltip-row">
-        <span class="tooltip-label">Est. Stalls</span>
-        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${props.count || "—"}</span>
+        <span class="tooltip-label">${displayMethod}</span>
+        <span class="tooltip-value" style="color:${accentColor};font-size:15px;font-weight:700;">${displayCount || "—"}</span>
       </div>
       ${props.spots_low && props.spots_high ? `<div class="tooltip-row"><span class="tooltip-label">Range</span><span class="tooltip-value">${props.spots_low}–${props.spots_high}</span></div>` : ""}
       ${props.cars > 0 ? `<div class="tooltip-row"><span class="tooltip-label">Cars Detected</span><span class="tooltip-value">${props.cars}</span></div>` : ""}
@@ -156,7 +173,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
 
   const onEachParking = useCallback((feature: any, layer: any) => {
     if (feature.properties) {
-      layer.bindTooltip(buildTooltipHTML(feature.properties, true), {
+      layer.bindTooltip(buildTooltipHTML(feature.properties, true, layers), {
         sticky: true,
         className: "parking-tooltip",
         direction: "top",
@@ -177,11 +194,11 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
         layer.setStyle(featureStyle(feature));
       });
     }
-  }, []);
+  }, [layers]);
 
   const onEachRoad = useCallback((feature: any, layer: any) => {
     if (feature.properties) {
-      layer.bindTooltip(buildTooltipHTML(feature.properties, false), {
+      layer.bindTooltip(buildTooltipHTML(feature.properties, false, layers), {
         sticky: true,
         className: "parking-tooltip",
         direction: "top",
@@ -199,7 +216,7 @@ export default function MapView({ lat, lng, radius, layers, geojsonData }: MapVi
         layer.setStyle(featureStyle(feature));
       });
     }
-  }, []);
+  }, [layers]);
 
   return (
     <div className="h-full w-full relative">

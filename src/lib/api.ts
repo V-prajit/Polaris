@@ -25,6 +25,9 @@ export interface ParkingFeature {
     name: string;
     type: "surface" | "garage" | "underground" | "street";
     count: number;
+    count_area?: number;
+    count_yolo?: number;
+    count_segformer?: number;
     spots: ConfidenceBand;
     cars?: ConfidenceBand;
     utilization?: UtilizationBand;
@@ -62,6 +65,20 @@ export async function fetchEstimate(
     lon: number,
     radius: number = 300
 ): Promise<EstimateResponse> {
+    // 1. Attempt to load from lightning-fast static cache
+    try {
+        const cacheName = `${lat.toFixed(3)}_${lon.toFixed(3)}_${radius}.json`;
+        const cacheUrl = `/precomputed/${cacheName}`;
+        const cacheRes = await fetch(cacheUrl);
+        if (cacheRes.ok) {
+            console.log(`[ParkSight] Serving INSTANT cache: ${cacheUrl}`);
+            return await cacheRes.json();
+        }
+    } catch (e) {
+        // Ignore and fall back to live backend
+    }
+
+    // 2. Fall back to live API
     const url = `${API_BASE}/api/estimate?lat=${lat}&lon=${lon}&radius=${radius}`;
     const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
     if (!res.ok) {
@@ -123,6 +140,9 @@ export function apiResponseToGeoJSON(
             name: f.name,
             featureType: f.type,
             count: f.count,
+            count_area: f.count_area,
+            count_yolo: f.count_yolo,
+            count_segformer: f.count_segformer,
             spots_low: f.spots?.low,
             spots_high: f.spots?.high,
             spots_method: f.spots?.method,
