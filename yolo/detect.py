@@ -2,13 +2,31 @@ import torch
 import numpy as np
 from shapely.geometry import box as shapely_box
 from ultralytics import YOLO
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance # Added ImageEnhance for TTA
 
 from parksight import config, pick_device, is_structure
 
 # COCO class IDs for vehicles visible from above
 _VEHICLE_CLASS_IDS = {3, 4, 5, 8}  # car, van, truck, bus
 _VEHICLE_CLASS_NAMES = {3: "car", 4: "van", 5: "truck", 8: "bus"}
+
+
+def _compute_iou(boxA, boxB):
+    """
+    Computes Intersection over Union for two bounding boxes.
+    Boxes are expected in (x1, y1, x2, y2) format.
+    """
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    unionArea = float(boxAArea + boxBArea - interArea)
+    if unionArea == 0:
+        return 0
+    return interArea / unionArea
 
 
 def mask_to_bboxes(mask: "np.ndarray", min_area: int = 500) -> list:
@@ -230,27 +248,85 @@ class YOLOParkingDetector:
                 )
             self._sahi_model.confidence_threshold = conf
 
-            result = get_sliced_prediction(
+            # Pass 1: Original Image
+            result1 = get_sliced_prediction(
                 tmp.name,
                 self._sahi_model,
-                slice_height=256,
-                slice_width=256,
-                overlap_height_ratio=0.4,
-                overlap_width_ratio=0.4,
+                slice_height=128,
+                slice_width=128,
+                overlap_height_ratio=0.25,
+                overlap_width_ratio=0.25,
                 verbose=0,
             )
             os.unlink(tmp.name)
-
+            
+            # Pass 2: Inverted Image (Test Time Augmentation)
+            inverted_img = ImageOps.invert(pil_image.convert("RGB"))
+            tmp_inv = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            inverted_img.save(tmp_inv.name)
+            tmp_inv.close()
+            
+            result2 = get_sliced_prediction(
+                tmp_inv.name,
+                self._sahi_model,
+                slice_height=128,
+                slice_width=128,
+                overlap_height_ratio=0.25,
+                overlap_width_ratio=0.25,
+                verbose=0,
+            )
+            os.unlink(tmp_inv.name)
+            
+            # Pass 3: Brightened Image (Pulls dark cars out of shadows)
+            bright_img = ImageEnhance.Brightness(pil_image.convert("RGB")).enhance(1.5)
+            tmp_br = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            bright_img.save(tmp_br.name)
+            tmp_br.close()
+            
+            result3 = get_sliced_prediction(
+                tmp_br.name,
+                self._sahi_model,
+                slice_height=128,
+                slice_width=128,
+                overlap_height_ratio=0.25,
+                overlap_width_ratio=0.25,
+                verbose=0,
+            )
+            os.unlink(tmp_br.name)
+            
+            # Combine all predictions from all 3 passes
+            all_preds = result1.object_prediction_list + result2.object_prediction_list + result3.object_prediction_list
+            
+            # Filter classes and map to format
+            formatted_boxes = []
+            for pred in all_preds:
+                cat_name = pred.category.name.lower()
+                if any(v in cat_name for v in ["car", "van", "truck", "bus"]):
+                    # Filter confidence >= 0.35 to balance false positives and recall
+                    if pred.score.value >= 0.35:
+                        box = pred.bbox
+                        formatted_boxes.append((pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value))
+                    
+            # Apply NMS
+            formatted_boxes.sort(key=lambda x: x[5], reverse=True)
+            kept_preds = []
+            for current in formatted_boxes:
+                overlap = False
+                for kept in kept_preds:
+                    if _compute_iou(current[1:5], kept[1:5]) > 0.20:
+                        overlap = True
+                        break
+                if not overlap:
+                    kept_preds.append(current)
+            
+            # Count valid ones against SegFormer mask
             count = 0
-            for pred in result.object_prediction_list:
-                cat = pred.category.name
-                if cat not in _VEHICLE_CLASS_NAMES.values():
-                    continue
-
+            for box_item in kept_preds:
+                pred = box_item[0]
                 if segformer_mask is not None:
-                    bbox = pred.bbox  # sahi BoundingBox
-                    cx = int((bbox.minx + bbox.maxx) / 2)
-                    cy = int((bbox.miny + bbox.maxy) / 2)
+                    box = pred.bbox
+                    cx = int((box.minx + box.maxx) / 2)
+                    cy = int((box.miny + box.maxy) / 2)
                     cx = min(max(cx, 0), img_w - 1)
                     cy = min(max(cy, 0), img_h - 1)
                     mh, mw = segformer_mask.shape[:2]
@@ -260,7 +336,7 @@ class YOLOParkingDetector:
                     my = min(max(my, 0), mh - 1)
                     if segformer_mask[my, mx] == 0:
                         continue
-
+                
                 count += 1
             return count
 
