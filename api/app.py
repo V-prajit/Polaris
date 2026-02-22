@@ -35,7 +35,6 @@ from parksight.fetch import (
     fetch_structured_parking_by_coords,
     fetch_street_parking_by_coords,
 )
-from parksight.count import get_line_count
 from parksight.estimate_structured import estimate_structured_parking, estimate_street_parking
 from parksight.confidence import confidence_band, utilization_band
 from parksight.vector_search import (
@@ -82,6 +81,14 @@ _SYNTHETIC_CAPACITY_MULTIPLIER = 1.6
 _SYNTHETIC_CAPACITY_BUFFER = 3
 _SYNTHETIC_FALLBACK_MIN = 8
 _SYNTHETIC_FALLBACK_MAX = 48
+
+# Surface-only OSM tags for /api/estimate and /api/macro.
+# Street lane tags are handled in the dedicated street pipeline.
+_SURFACE_OSM_TAGS = {
+    "amenity": ["parking", "parking_space"],
+    "parking": ["surface"],
+    "landuse": ["parking"],
+}
 
 def _get_detector():
     global _detector
@@ -418,9 +425,9 @@ def _run_surface_detection(gdf_3857):
                     count_segformer = 0
 
         elif geom.geom_type in ("LineString", "MultiLineString"):
-            count = get_line_count(geom)
-            count_area = count
-            spot_method = "street"
+            # Street parking is estimated in the dedicated street section;
+            # skip line features here to avoid duplicate counting.
+            continue
 
         if count <= 0 and count_area <= 0:
             continue
@@ -513,7 +520,7 @@ def estimate(
     t_start = time.time()
 
     # --- 1. surface lots ---
-    gdf = get_parking_data_by_coords(lat, lon, dist=radius)
+    gdf = get_parking_data_by_coords(lat, lon, dist=radius, tags=_SURFACE_OSM_TAGS)
     surface_features = []
     surface_total = 0
 
@@ -714,7 +721,7 @@ def macro(
             street_total = 0
 
             # --- surface ---
-            gdf = get_parking_data_by_coords(lat, lon, dist=radius)
+            gdf = get_parking_data_by_coords(lat, lon, dist=radius, tags=_SURFACE_OSM_TAGS)
             if gdf is not None and not gdf.empty:
                 gdf_3857 = gdf.to_crs(epsg=3857)
                 for _, row in gdf_3857.iterrows():
@@ -724,8 +731,6 @@ def macro(
                         continue
                     if geom.geom_type in ("Polygon", "MultiPolygon"):
                         count = int((geom.area / stall_area) * usable)
-                    elif geom.geom_type in ("LineString", "MultiLineString"):
-                        count = get_line_count(geom)
                     else:
                         count = 0
                     surface_total += max(count, 0)

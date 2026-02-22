@@ -26,6 +26,33 @@ from parksight.segment import ParkingSegmenter
 from parksight import is_structure
 
 
+def _find_segformer_checkpoint() -> Path | None:
+    """Match checkpoint search order used by the API."""
+    candidates = [
+        PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
+        PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
+        PROJECT_ROOT / "models" / "segformer_best",
+        PROJECT_ROOT / "models" / "best_model",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _load_spot_yolo():
+    """Load parking-spot YOLO model for SegFormer comparison."""
+    from yolo.detect import YOLOParkingDetector
+
+    apklot = PROJECT_ROOT / "models" / "yolo_apklot_best.pt"
+    parkseg = PROJECT_ROOT / "models" / "yolo26n_run1.pt"
+    if apklot.exists():
+        return YOLOParkingDetector(str(apklot), count_mode="detect"), "APKLOT", "detect"
+    if parkseg.exists():
+        return YOLOParkingDetector(str(parkseg), count_mode="area"), "ParkSeg", "area"
+    return None, "none", "none"
+
+
 def _add_label(img: Image.Image, text: str) -> Image.Image:
     """Return a copy of *img* with a label bar at the top."""
     BAR_H = 28
@@ -88,9 +115,14 @@ def main():
     parser.add_argument("--max-examples", type=int, default=25, help="Max tiles to include in the comparison grid (default: 25)")
     args = parser.parse_args()
 
-    model_path = PROJECT_ROOT / "models" / "segformer_best"
-    if not model_path.exists():
-        print(f"ERROR: Model not found at {model_path}")
+    model_path = _find_segformer_checkpoint()
+    if model_path is None:
+        print("ERROR: SegFormer checkpoint not found.")
+        print("Checked:")
+        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg-final' / 'best_model'}")
+        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg' / 'best_model'}")
+        print(f"  - {PROJECT_ROOT / 'models' / 'segformer_best'}")
+        print(f"  - {PROJECT_ROOT / 'models' / 'best_model'}")
         sys.exit(1)
 
     print(f"Loading SegFormer from {model_path} ...")
@@ -105,13 +137,12 @@ def main():
 
     gdf_3857 = gdf.to_crs(epsg=3857)
 
-    # Also load YOLO for comparison if available
-    yolo_detector = None
-    yolo_weights = PROJECT_ROOT / "models" / "yolo_aerial_cars.pt"
-    if yolo_weights.exists():
-        from yolo.detect import YOLOParkingDetector
-        print(f"Loading YOLO from {yolo_weights} for comparison ...")
-        yolo_detector = YOLOParkingDetector(str(yolo_weights))
+    # Also load YOLO spot detector for comparison if available
+    yolo_detector, yolo_name, yolo_mode = _load_spot_yolo()
+    if yolo_detector is not None:
+        print(f"Loading YOLO spot detector ({yolo_name}, count_mode={yolo_mode}) for comparison ...")
+    else:
+        print("No YOLO spot weights found (yolo_apklot_best.pt or yolo26n_run1.pt).")
 
     print(f"\nFound {len(gdf_3857)} parking features. Processing surface lots...\n")
     print(f"{'#':<4} {'Name':<30} {'Area m²':<10} {'SegFormer':<12} {'Method':<8} {'YOLO':<8}")
