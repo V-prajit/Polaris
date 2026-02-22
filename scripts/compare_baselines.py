@@ -25,7 +25,7 @@ from parksight.estimate_structured import estimate_structured_parking, estimate_
 
 
 def run_geometric_baseline(gdf_3857):
-    """Tier 0: ITE/NPA design-standards estimator using OSM polygon geometry."""
+    """Tier 0: returns (total, {row_position: count})."""
     from parksight.count import count_geometric
     from shapely.ops import unary_union
 
@@ -47,18 +47,23 @@ def run_geometric_baseline(gdf_3857):
                 pass
 
     total = 0
-    for idx, (_, row) in enumerate(gdf_3857.iterrows()):
-        if not keep[idx]:
+    per_lot = {}
+    for pos, (_, row) in enumerate(gdf_3857.iterrows()):
+        if not keep[pos]:
+            per_lot[pos] = 0
             continue
         geom = row.geometry
         if geom.geom_type not in ("Polygon", "MultiPolygon"):
+            per_lot[pos] = 0
             continue
         try:
             result = count_geometric(geom, osm_tags=row.to_dict())
+            per_lot[pos] = result.count
             total += result.count
         except Exception as e:
             print(f"  Geometric skip: {e}")
-    return total
+            per_lot[pos] = 0
+    return total, per_lot
 
 
 def run_cv_baseline(gdf_3857):
@@ -153,12 +158,97 @@ def run_enhanced_pipeline(gdf_3857, address, radius, weights_path):
     return grand_total, surface_total, structured_total, street_total
 
 
+def save_lot_images(gdf_3857, out_dir: Path, address: str,
+                    per_lot_counts: dict | None = None,
+                    max_images: int | None = None):
+    """Save satellite tiles with OSM polygon overlay and per-lot counts."""
+    import random
+    try:
+        import contextily as ctx
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Polygon as MplPolygon
+    except ImportError as e:
+        print(f"  [images] skipped — missing dependency: {e}")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect polygon rows and optionally random-sample
+    poly_rows = [
+        (i, pos, idx, row)
+        for i, (pos, (idx, row)) in enumerate(
+            ((p, item) for p, item in enumerate(gdf_3857.iterrows())), 1
+        )
+        if row.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
+    if max_images and len(poly_rows) > max_images:
+        poly_rows = random.sample(poly_rows, max_images)
+        poly_rows.sort(key=lambda x: x[0])  # keep display order
+
+    print(f"\n[*] Saving {len(poly_rows)} lot image(s) to {out_dir}/")
+    counts = per_lot_counts or {}
+
+    for i, pos, idx, row in poly_rows:
+        geom   = row.geometry
+        osm_id = str(idx[1]) if isinstance(idx, tuple) else str(idx)
+        name   = str(row.get("name", "") or "")[:22] or osm_id
+
+        try:
+            minx, miny, maxx, maxy = geom.bounds
+            pad = max(maxx - minx, maxy - miny) * 0.15
+            img_arr, ext = ctx.bounds2img(
+                minx - pad, miny - pad, maxx + pad, maxy + pad,
+                zoom=19, ll=False,
+                source=ctx.providers.Esri.WorldImagery,
+            )
+
+            fig, ax = plt.subplots(figsize=(6, 6))
+            ax.imshow(img_arr, extent=ext, origin="upper")
+
+            exterior = (
+                list(geom.exterior.coords)
+                if geom.geom_type == "Polygon"
+                else list(geom.geoms[0].exterior.coords)
+            )
+            ax.add_patch(MplPolygon(
+                exterior, closed=True,
+                edgecolor="red", facecolor=(1, 0, 0, 0.08), linewidth=2.5,
+            ))
+
+            # Build count annotation
+            lot_c = counts.get(pos, {})
+            count_str = "  ".join(
+                f"{k}={v}" for k, v in lot_c.items() if v
+            ) or "no counts"
+            ax.set_title(
+                f"#{i} {name}\narea={geom.area:.0f} m\u00b2  |  {count_str}",
+                fontsize=8,
+            )
+            ax.axis("off")
+            plt.tight_layout(pad=0.5)
+
+            fname = out_dir / f"lot_{i:02d}_{osm_id}.png"
+            plt.savefig(fname, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  saved {fname.name}  [{count_str}]")
+        except Exception as e:
+            print(f"  lot {i} image failed: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare all parking counting methods")
     parser.add_argument("--address", required=True, type=str)
     parser.add_argument("--radius", default=300, type=int)
     parser.add_argument("--weights", default="models/yolo26n_run1.pt", type=str)
     parser.add_argument("--skip-ml", action="store_true", help="Skip Grounding DINO (slow to download)")
+    parser.add_argument("--save-images", type=Path, default=None,
+                        metavar="DIR",
+                        help="Save satellite tile per lot to DIR (e.g. lot_images/)")
+    parser.add_argument("--max-images", type=int, default=None,
+                        metavar="N",
+                        help="Randomly sample N lots for images (default: all)")
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
@@ -183,7 +273,7 @@ def main():
     # --- tier 0: geometric baseline ---
     print("[0] Running Geometric Baseline (ITE/NPA design standards)...")
     t0 = time.time()
-    geo_total = run_geometric_baseline(gdf_3857)
+    geo_total, geo_per_lot = run_geometric_baseline(gdf_3857)
     geo_time = time.time() - t0
     results["Geometric (design std)"] = {"total": geo_total, "time": geo_time}
     print(f"    Total: {geo_total} spots | Time: {geo_time:.1f}s\n")
@@ -197,6 +287,13 @@ def main():
     results["CV Baseline"] = {"total": cv_total, "time": cv_time}
     print(f"      Total: {cv_total} spots | Time: {cv_time:.1f}s\n")
 
+    # Build per-lot counts dict for image labels {row_pos: {method: count}}
+    per_lot_counts: dict = {}
+    for pos, c in enumerate(cv_counts):
+        per_lot_counts.setdefault(pos, {})["cv"] = c
+    for pos, c in geo_per_lot.items():
+        per_lot_counts.setdefault(pos, {})["geo"] = c
+
     # --- tier 2: ml baseline ---
     if not args.skip_ml:
         print("[2/4] Running ML Baseline (Grounding DINO)...")
@@ -206,28 +303,31 @@ def main():
         ml_total = sum(ml_counts)
         results["ML Baseline"] = {"total": ml_total, "time": ml_time}
         print(f"      Total: {ml_total} spots | Time: {ml_time:.1f}s\n")
+        for pos, c in enumerate(ml_counts):
+            per_lot_counts.setdefault(pos, {})["ml"] = c
     else:
         print("[2/4] Skipping ML Baseline (--skip-ml)\n")
 
-    # --- yolo26 pipeline ---
-    print("[3/4] Running YOLO26 Pipeline...")
-    t0 = time.time()
-    yolo_counts = run_yolo_pipeline(gdf_3857, args.weights)
-    yolo_time = time.time() - t0
-    yolo_total = sum(yolo_counts)
-    results["YOLO26 (raw)"] = {"total": yolo_total, "time": yolo_time}
-    print(f"      Total: {yolo_total} spots | Time: {yolo_time:.1f}s\n")
 
-    # --- enhanced pipeline ---
-    print("[4/4] Running Enhanced Pipeline (YOLO + OSM structures + streets)...")
-    t0 = time.time()
-    enhanced_total, surface, structured, street = run_enhanced_pipeline(
-        gdf_3857, args.address, args.radius, args.weights
-    )
-    enhanced_time = time.time() - t0
-    results["Enhanced"] = {"total": enhanced_total, "time": enhanced_time}
-    print(f"      Surface: {surface} | Garages: {structured} | Street: {street}")
-    print(f"      Total: {enhanced_total} spots | Time: {enhanced_time:.1f}s\n")
+    # --- yolo26 pipeline (commented out — model not yet trained) ---
+    # print("[3/4] Running YOLO26 Pipeline...")
+    # t0 = time.time()
+    # yolo_counts = run_yolo_pipeline(gdf_3857, args.weights)
+    # yolo_time = time.time() - t0
+    # yolo_total = sum(yolo_counts)
+    # results["YOLO26 (raw)"] = {"total": yolo_total, "time": yolo_time}
+    # print(f"      Total: {yolo_total} spots | Time: {yolo_time:.1f}s\n")
+
+    # --- enhanced pipeline (commented out — requires trained YOLO model) ---
+    # print("[4/4] Running Enhanced Pipeline (YOLO + OSM structures + streets)...")
+    # t0 = time.time()
+    # enhanced_total, surface, structured, street = run_enhanced_pipeline(
+    #     gdf_3857, args.address, args.radius, args.weights
+    # )
+    # enhanced_time = time.time() - t0
+    # results["Enhanced"] = {"total": enhanced_total, "time": enhanced_time}
+    # print(f"      Surface: {surface} | Garages: {structured} | Street: {street}")
+    # print(f"      Total: {enhanced_total} spots | Time: {enhanced_time:.1f}s\n")
 
     # --- summary table ---
     print(f"\n{'='*60}")
@@ -238,6 +338,14 @@ def main():
     for name, data in results.items():
         print(f"  {name:<30} {data['total']:>12,} {data['time']:>9.1f}s")
     print(f"{'='*60}\n")
+
+    # --- save images ---
+    if args.save_images:
+        save_lot_images(
+            gdf_3857, args.save_images, args.address,
+            per_lot_counts=per_lot_counts,
+            max_images=args.max_images,
+        )
 
 
 if __name__ == "__main__":

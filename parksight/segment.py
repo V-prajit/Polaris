@@ -92,7 +92,7 @@ class ParkingSegmenter:
         model_id_or_path: Union[str, Path] = "nvidia/segformer-b5-finetuned-ade-640-640",
         device: str | None = None,
         is_finetuned: bool | None = None,
-        stall_area_px: int = 1_600,
+        stall_area_px: int = 400,
         avg_car_area_px: int = 1_200,
     ) -> None:
         self.model_id_or_path = str(model_id_or_path)
@@ -108,7 +108,7 @@ class ParkingSegmenter:
 
                 with cfg_path.open() as f:
                     cfg = json.load(f)
-                n = cfg.get("num_labels", 999)
+                n = cfg.get("num_labels", len(cfg.get("id2label", {})) or 999)
                 is_finetuned = n <= 4
             else:
                 is_finetuned = False  # assume HF hub zero-shot checkpoint
@@ -187,6 +187,7 @@ class ParkingSegmenter:
 
         self._load()
 
+        pil_image = pil_image.convert("RGB")
         orig_w, orig_h = pil_image.size
         inputs = self._processor(images=pil_image, return_tensors="pt").to(self.device)
 
@@ -228,6 +229,7 @@ class ParkingSegmenter:
 
         self._load()
 
+        pil_image = pil_image.convert("RGB")
         orig_w, orig_h = pil_image.size
 
         # generate 4 augmented versions
@@ -281,15 +283,17 @@ class ParkingSegmenter:
         """
         Clean up a binary parking mask with morphological operations.
 
-        Applies closing (fill small holes), then removes tiny blobs.
+        Uses a small kernel (5×5, 1 iteration) to fill tiny holes without
+        merging adjacent parking stalls into single blobs.
         """
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-        # close small gaps inside parking regions
-        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        # close small gaps inside parking regions (gentle — 1 iteration)
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         # open to remove tiny noise blobs
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+        small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, small_kernel, iterations=1)
 
         # remove connected components smaller than min_blob_px
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -356,8 +360,13 @@ class ParkingSegmenter:
         cc_count = 0
         for i in range(1, num_labels):  # skip background label 0
             area = int(stats[i, cv2.CC_STAT_AREA])
-            if min_area <= area <= max_area:
-                cc_count += 1
+            if area < min_area:
+                continue  # noise — skip
+            if area <= max_area:
+                cc_count += 1  # single stall-sized blob
+            else:
+                # Large merged region — estimate stall count from its area
+                cc_count += max(1, round(area / stall_area_px))
 
         return {"area_count": area_count, "cc_count": cc_count}
 
@@ -365,6 +374,7 @@ class ParkingSegmenter:
         self,
         pil_image: Image.Image,
         geo_scale_mpp: float | None = None,
+        apply_postprocess: bool = True,
     ) -> SegmentationResult:
         """
         End-to-end: segment → count → return structured result.
@@ -375,6 +385,8 @@ class ParkingSegmenter:
             RGB satellite tile.
         geo_scale_mpp : float or None
             Metres per pixel.  See :meth:`_count_from_mask`.
+        apply_postprocess : bool
+            If True (default), apply morphological cleanup before counting.
 
         Returns
         -------
@@ -383,6 +395,8 @@ class ParkingSegmenter:
             ``area_count``, and ``cc_count``.
         """
         mask = self.segment(pil_image)
+        if apply_postprocess:
+            mask = self.postprocess_mask(mask)
         counts = self._count_from_mask(mask, geo_scale_mpp=geo_scale_mpp)
         area_count = counts["area_count"]
         cc_count = counts["cc_count"]

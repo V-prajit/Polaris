@@ -221,10 +221,28 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Data
-    p.add_argument("--data_dir", required=True, type=Path, help="ParkSeg12k root directory (contains images/ and masks/)")
+    p.add_argument(
+        "--data_dir",
+        required=True,
+        type=Path,
+        help=(
+            "Dataset root directory. Supports either ParkSeg layout (images/ + masks/) "
+            "or YOLO pre-split layout (train/images + train/labels)."
+        ),
+    )
+    p.add_argument(
+        "--dataset_layout",
+        type=str,
+        choices=["auto", "parkseg", "yolo"],
+        default="auto",
+        help=(
+            "Dataset format selector. 'auto' detects layout; 'parkseg' forces images/masks; "
+            "'yolo' forces train/val images+labels."
+        ),
+    )
     p.add_argument("--val_split", type=float, default=0.15, help="Validation fraction (default 0.15)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--stall_class_ids", nargs="+", type=int, default=[1, 2, 3], help="ParkSeg12k class IDs to map to 'stall' (default: 1 2 3)")
+    p.add_argument("--stall_class_ids", nargs="+", type=int, default=[255], help="ParkSeg12k class IDs to map to 'stall' (default: 255 — ParkSeg12k uses 0=bg, 255=stall)")
 
     # Model
     p.add_argument("--base_model", type=str, default="nvidia/segformer-b5-finetuned-ade-640-640", help="HuggingFace model ID to start from")
@@ -239,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--lr_power", type=float, default=0.9, help="PolynomialLR power")
     p.add_argument("--early_stop_patience", type=int, default=7, help="Epochs without val mIoU improvement before stopping")
-    p.add_argument("--class_weight_bg", type=float, default=0.3, help="Cross-entropy weight for background class (stall weight = 1.0)")
+    p.add_argument("--class_weight_bg", type=float, default=0.1, help="Cross-entropy weight for background class (stall weight = 1.0)")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--amp", action="store_true", default=True, help="Use mixed precision (default True)")
     p.add_argument("--no_amp", dest="amp", action="store_false")
@@ -370,12 +388,13 @@ def main() -> None:
     is_distributed = world_size > 1
     if is_distributed:
         dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
     else:
+        rank = 0
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    rank = local_rank
     is_main = rank == 0
 
     if is_main:
@@ -388,13 +407,45 @@ def main() -> None:
     np.random.seed(args.seed + rank)
 
     # ── DataLoaders ────────────────────────────────────────────────────
-    # Auto-detect YOLO pre-split layout (data_dir/train/images exists)
     yolo_train_dir = args.data_dir / "train" / "images"
-    if yolo_train_dir.is_dir():
+    yolo_val_dir = args.data_dir / "val" / "images"
+    parkseg_img_dir = args.data_dir / "images"
+    parkseg_mask_dir = args.data_dir / "masks"
+
+    has_yolo_layout = yolo_train_dir.is_dir() and yolo_val_dir.is_dir()
+    has_parkseg_layout = parkseg_img_dir.is_dir() and parkseg_mask_dir.is_dir()
+
+    if args.dataset_layout == "auto":
+        if has_yolo_layout and has_parkseg_layout:
+            raise ValueError(
+                f"Ambiguous dataset layout under {args.data_dir}: both YOLO (train/val) and "
+                "ParkSeg (images/masks) structures exist. Pass --dataset_layout parkseg|yolo explicitly."
+            )
+        if has_yolo_layout:
+            dataset_layout = "yolo"
+        elif has_parkseg_layout:
+            dataset_layout = "parkseg"
+        else:
+            raise FileNotFoundError(
+                f"Could not detect dataset layout under {args.data_dir}. Expected either "
+                "train/images+val/images (YOLO) or images/+masks/ (ParkSeg)."
+            )
+    else:
+        dataset_layout = args.dataset_layout
+        if dataset_layout == "yolo" and not has_yolo_layout:
+            raise FileNotFoundError(
+                f"--dataset_layout yolo was requested but missing train/val images layout under {args.data_dir}."
+            )
+        if dataset_layout == "parkseg" and not has_parkseg_layout:
+            raise FileNotFoundError(
+                f"--dataset_layout parkseg was requested but missing images/ and masks/ under {args.data_dir}."
+            )
+
+    if dataset_layout == "yolo":
         if is_main:
-            logger.info("Detected YOLO pre-split layout — using YoloSegDataset")
+            logger.info("Using YoloSegDataset (train/val images+labels layout)")
         train_ds = YoloSegDataset(args.data_dir, split="train", img_size=args.img_size, augment=True)
-        val_ds   = YoloSegDataset(args.data_dir, split="val",   img_size=args.img_size, augment=False)
+        val_ds = YoloSegDataset(args.data_dir, split="val", img_size=args.img_size, augment=False)
     else:
         if is_main:
             logger.info("Using ParkSegDataset (images/ + masks/ layout)")
@@ -466,9 +517,20 @@ def main() -> None:
     import torch.nn.functional as F
 
     def weighted_ce_loss(logits, labels, class_weights, ignore_index=255):
-        """Apply weighted CrossEntropyLoss with upsampling."""
-        upsampled = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-        return F.cross_entropy(upsampled, labels, weight=class_weights, ignore_index=ignore_index)
+        """Downsample labels to logit resolution, then compute weighted CE.
+
+        Standard SegFormer practice: keep logits at native H/4×W/4 resolution
+        and downsample labels with nearest-neighbor. Avoids bilinear smoothing
+        of logits which blurs decision boundaries.
+        """
+        logit_h, logit_w = logits.shape[2], logits.shape[3]
+        if labels.shape[-2:] != (logit_h, logit_w):
+            labels = F.interpolate(
+                labels.unsqueeze(1).float(),
+                size=(logit_h, logit_w),
+                mode="nearest",
+            ).squeeze(1).long()
+        return F.cross_entropy(logits, labels, weight=class_weights, ignore_index=ignore_index)
 
     # ── Optimiser & scheduler ──────────────────────────────────────────
     # Layer-wise LR decay: encoder backbone gets 0.1× LR, decoder gets full LR.
@@ -500,8 +562,10 @@ def main() -> None:
         t0 = time.time()
 
         # --- Custom train loop (to use weighted loss) ---
-        core_model = model.module if is_distributed else model
-        core_model.train()
+        # IMPORTANT: use `model` (the DDP wrapper) for the forward pass so that
+        # gradient synchronisation across GPUs actually happens.  Calling
+        # `model.module(...)` bypasses DDP and silences gradient all-reduce.
+        model.train()
         total_loss = 0.0
         steps = 0
         optimizer.zero_grad()
@@ -511,7 +575,7 @@ def main() -> None:
             labels = batch["labels"].to(device)
 
             with torch.amp.autocast("cuda", enabled=(args.amp and "cuda" in device)):
-                outputs = core_model(pixel_values=pixel_values)
+                outputs = model(pixel_values=pixel_values)
                 loss = weighted_ce_loss(outputs.logits, labels, class_weights) / args.grad_accum
 
             if args.amp and "cuda" in device:
@@ -534,13 +598,38 @@ def main() -> None:
             total_loss += loss.item() * args.grad_accum
             steps += 1
 
-        train_metrics = {"loss": total_loss / max(steps, 1)}
+        # Handle leftover gradients when len(loader) % grad_accum != 0
+        if steps % args.grad_accum != 0:
+            if args.amp and "cuda" in device:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        train_totals = torch.tensor([total_loss, float(steps)], dtype=torch.float64, device=device)
+        if is_distributed:
+            dist.all_reduce(train_totals, op=dist.ReduceOp.SUM)
+
+        train_metrics = {
+            "loss": float(train_totals[0] / torch.clamp(train_totals[1], min=1.0))
+        }
 
         # --- Validation ---
+        # For validation we can use the unwrapped model (no gradient sync needed)
+        core_model = model.module if is_distributed else model
         core_model.eval()
-        all_preds, all_labels_list = [], []
         val_loss = 0.0
         val_steps = 0
+        num_classes = 2
+        intersections = torch.zeros(num_classes, dtype=torch.float64, device=device)
+        unions = torch.zeros(num_classes, dtype=torch.float64, device=device)
+        correct = torch.tensor(0.0, dtype=torch.float64, device=device)
+        valid_pixels = torch.tensor(0.0, dtype=torch.float64, device=device)
 
         with torch.no_grad():
             for batch in val_loader:
@@ -551,21 +640,42 @@ def main() -> None:
                     outputs = core_model(pixel_values=pixel_values)
                     v_loss = weighted_ce_loss(outputs.logits, labels, class_weights)
 
+                # Upsample logits to full resolution for metric computation
                 upsampled = F.interpolate(outputs.logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
                 preds = upsampled.argmax(dim=1)
-                all_preds.append(preds.cpu().numpy().flatten())
-                all_labels_list.append(labels.cpu().numpy().flatten())
+
+                valid = labels != 255
+                correct += ((preds == labels) & valid).sum().double()
+                valid_pixels += valid.sum().double()
+                for c in range(num_classes):
+                    pred_c = (preds == c) & valid
+                    label_c = (labels == c) & valid
+                    intersections[c] += (pred_c & label_c).sum().double()
+                    unions[c] += (pred_c | label_c).sum().double()
+
                 val_loss += v_loss.item()
                 val_steps += 1
 
-        preds_np = np.concatenate(all_preds)
-        labels_np = np.concatenate(all_labels_list)
-        val_miou = compute_miou(preds_np, labels_np)
-        val_acc = compute_pixel_acc(preds_np, labels_np)
+        val_totals = torch.tensor([val_loss, float(val_steps)], dtype=torch.float64, device=device)
+        if is_distributed:
+            dist.all_reduce(intersections, op=dist.ReduceOp.SUM)
+            dist.all_reduce(unions, op=dist.ReduceOp.SUM)
+            dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+            dist.all_reduce(valid_pixels, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_totals, op=dist.ReduceOp.SUM)
+
+        ious = intersections / torch.clamp(unions, min=1.0)
+        present_classes = unions > 0
+        val_miou = float(ious[present_classes].mean().item()) if bool(present_classes.any().item()) else 0.0
+        val_acc = float((correct / torch.clamp(valid_pixels, min=1.0)).item())
+
+        # Per-class IoU for diagnostics (stall IoU is what actually matters)
+        stall_iou = float(ious[1].item()) if unions[1].item() > 0 else 0.0
         val_metrics = {
-            "val_loss": val_loss / max(val_steps, 1),
+            "val_loss": float(val_totals[0] / torch.clamp(val_totals[1], min=1.0)),
             "val_miou": val_miou,
             "val_pixel_acc": val_acc,
+            "val_stall_iou": stall_iou,
         }
 
         elapsed = time.time() - t0
@@ -578,26 +688,42 @@ def main() -> None:
         }
         all_metrics.append(epoch_metrics)
 
+        is_best = val_miou > best_miou
+        if is_best:
+            best_miou = val_miou
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
         if is_main:
             logger.info(
-                "Epoch %02d/%02d | loss=%.4f | val_loss=%.4f | mIoU=%.4f | pxAcc=%.4f | %.0fs",
+                "Epoch %02d/%02d | loss=%.4f | val_loss=%.4f | mIoU=%.4f | stall_IoU=%.4f | pxAcc=%.4f | %.0fs",
                 epoch, args.epochs,
                 train_metrics["loss"],
                 val_metrics["val_loss"],
                 val_miou,
+                stall_iou,
                 val_acc,
                 elapsed,
             )
 
             # Save best checkpoint
-            if val_miou > best_miou:
-                best_miou = val_miou
-                patience_counter = 0
+            if is_best:
                 best_dir = args.output_dir / "best_model"
                 core_model.save_pretrained(best_dir)
-                logger.info("  ✓ New best mIoU=%.4f → saved to %s", best_miou, best_dir)
+                # Save processor config so inference can load it
+                from transformers import SegformerImageProcessor
+                proc = SegformerImageProcessor(
+                    do_resize=True,
+                    size={"height": args.img_size, "width": args.img_size},
+                    do_rescale=True,
+                    do_normalize=True,
+                    image_mean=[0.485, 0.456, 0.406],
+                    image_std=[0.229, 0.224, 0.225],
+                )
+                proc.save_pretrained(best_dir)
+                logger.info("  ✓ New best mIoU=%.4f (stall_IoU=%.4f) → saved to %s", best_miou, stall_iou, best_dir)
             else:
-                patience_counter += 1
                 logger.info("  Patience: %d/%d", patience_counter, args.early_stop_patience)
 
             # Save metrics JSON
@@ -614,6 +740,16 @@ def main() -> None:
         final_dir = args.output_dir / "final_model"
         core_model = model.module if is_distributed else model
         core_model.save_pretrained(final_dir)
+        from transformers import SegformerImageProcessor
+        proc = SegformerImageProcessor(
+            do_resize=True,
+            size={"height": args.img_size, "width": args.img_size},
+            do_rescale=True,
+            do_normalize=True,
+            image_mean=[0.485, 0.456, 0.406],
+            image_std=[0.229, 0.224, 0.225],
+        )
+        proc.save_pretrained(final_dir)
         logger.info("Final model saved to %s", final_dir)
         logger.info("Training complete. Best val mIoU: %.4f", best_miou)
 

@@ -15,7 +15,7 @@ Usage
         --output_csv results/segformer_eval.csv
 
 Output columns in CSV:
-    image_path, val_miou, val_pixel_acc, gt_count, pred_count, abs_err, rel_err
+    image_path, miou, stall_iou, pixel_acc, gt_count, pred_count, abs_err, rel_err
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--output_csv", type=Path, default=Path("results/segformer_eval.csv"), help="Where to write per-image CSV results")
-    p.add_argument("--stall_area_px", type=int, default=1600, help="Avg stall area in pixels (512×512 canonical)")
+    p.add_argument("--stall_area_px", type=int, default=400, help="Avg stall area in pixels (512×512 canonical)")
     p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
@@ -80,6 +80,12 @@ def compute_miou(preds: np.ndarray, labels: np.ndarray, num_classes: int = 2) ->
             continue
         ious.append(i / u)
     return float(np.mean(ious)) if ious else 0.0
+
+
+def compute_class_iou(preds: np.ndarray, labels: np.ndarray, class_id: int) -> float:
+    inter = ((preds == class_id) & (labels == class_id)).sum()
+    union = ((preds == class_id) | (labels == class_id)).sum()
+    return float(inter / union) if union > 0 else 0.0
 
 
 def mask_to_count(mask: np.ndarray, stall_area_px: int) -> int:
@@ -162,6 +168,7 @@ def main() -> None:
             label = labels_np_batch[i]  # (H, W)
 
             miou = compute_miou(pred.flatten(), label.flatten())
+            stall_iou = compute_class_iou(pred.flatten(), label.flatten(), class_id=1)
             px_acc = float((pred == label).mean())
 
             gt_count = mask_to_count(label.astype(np.uint8), args.stall_area_px)
@@ -173,6 +180,7 @@ def main() -> None:
             rows.append({
                 "image_path": image_paths[i],
                 "miou": round(miou, 4),
+                "stall_iou": round(stall_iou, 4),
                 "pixel_acc": round(px_acc, 4),
                 "gt_count": gt_count,
                 "pred_count": pred_count,
@@ -192,6 +200,7 @@ def main() -> None:
     all_preds_np = np.concatenate(global_preds_all)
     all_labels_np = np.concatenate(global_labels_all)
     global_miou = compute_miou(all_preds_np, all_labels_np)
+    global_stall_iou = compute_class_iou(all_preds_np, all_labels_np, class_id=1)
     global_px_acc = float((all_preds_np == all_labels_np).mean())
     mean_abs_err = float(np.mean(abs_errors))
     mean_rel_err = float(np.mean(rel_errors))
@@ -199,6 +208,7 @@ def main() -> None:
 
     logger.info("=" * 50)
     logger.info("Global mIoU          : %.4f", global_miou)
+    logger.info("Global stall IoU     : %.4f", global_stall_iou)
     logger.info("Global pixel accuracy: %.4f", global_px_acc)
     logger.info("Mean absolute error  : %.2f stalls", mean_abs_err)
     logger.info("Median absolute error: %.2f stalls", median_abs_err)
@@ -206,7 +216,7 @@ def main() -> None:
     logger.info("=" * 50)
 
     # Write CSV
-    fieldnames = ["image_path", "miou", "pixel_acc", "gt_count", "pred_count", "abs_err", "rel_err"]
+    fieldnames = ["image_path", "miou", "stall_iou", "pixel_acc", "gt_count", "pred_count", "abs_err", "rel_err"]
     with args.output_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -218,6 +228,7 @@ def main() -> None:
         writer.writerow({
             "image_path": "AGGREGATE",
             "miou": round(global_miou, 4),
+            "stall_iou": round(global_stall_iou, 4),
             "pixel_acc": round(global_px_acc, 4),
             "gt_count": "—",
             "pred_count": "—",
