@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Gauge, Road, Zap, Sun } from "lucide-react";
+import { Gauge, Route, Zap, Sun } from "lucide-react";
 
 interface TrafficData {
     avgLanes: number;
@@ -34,7 +34,7 @@ function Pill({ children, color }: { children: React.ReactNode; color: string })
 export function TrafficAnalysis({ data, delay = 0 }: TrafficAnalysisProps) {
     const items = [
         {
-            icon: <Road className="w-3.5 h-3.5" />,
+            icon: <Route className="w-3.5 h-3.5" />,
             label: "Avg Lanes",
             value: data.avgLanes.toFixed(1),
             sub: `max ${data.maxLanes}`,
@@ -71,7 +71,7 @@ export function TrafficAnalysis({ data, delay = 0 }: TrafficAnalysisProps) {
             className="glass-panel rounded-xl p-5 space-y-4"
         >
             <h3 className="text-sm font-semibold tracking-tight flex items-center gap-2">
-                <Road className="w-4 h-4 text-muted-foreground" />
+                <Route className="w-4 h-4 text-muted-foreground" />
                 Traffic & Infrastructure
             </h3>
 
