@@ -88,7 +88,7 @@ def main():
     parser.add_argument("--max-examples", type=int, default=25, help="Max tiles to include in the comparison grid (default: 25)")
     args = parser.parse_args()
 
-    model_path = PROJECT_ROOT / "models" / "best_model"
+    model_path = PROJECT_ROOT / "models" / "segformer_best"
     if not model_path.exists():
         print(f"ERROR: Model not found at {model_path}")
         sys.exit(1)
@@ -107,7 +107,7 @@ def main():
 
     # Also load YOLO for comparison if available
     yolo_detector = None
-    yolo_weights = PROJECT_ROOT / "models" / "yolo26n_run1.pt"
+    yolo_weights = PROJECT_ROOT / "models" / "yolo_aerial_cars.pt"
     if yolo_weights.exists():
         from yolo.detect import YOLOParkingDetector
         print(f"Loading YOLO from {yolo_weights} for comparison ...")

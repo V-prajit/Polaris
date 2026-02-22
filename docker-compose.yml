@@ -1,0 +1,10 @@
+services:
+  actian-vectorai-db:
+    image: localhost/actian/vectoraidb:1.0b
+    container_name: actian-vectorai-db
+    platform: linux/amd64
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./data/vectordb:/data
+    restart: unless-stopped

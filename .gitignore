@@ -8,3 +8,4 @@ scripts/__pycache__
 /cache
 /api/__pycache__
 lot_images/
+.env

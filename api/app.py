@@ -11,14 +11,18 @@ import time
 import logging
 from pathlib import Path
 import math
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from cachetools import TTLCache, cached
 import h3
 
 
 import geopandas as gpd
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 # make sure parksight + yolo are importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +38,11 @@ from parksight.fetch import (
 from parksight.count import get_line_count
 from parksight.estimate_structured import estimate_structured_parking, estimate_street_parking
 from parksight.confidence import confidence_band, utilization_band
+from parksight.vector_search import (
+    get_vector_index_status,
+    index_hex_cells,
+    semantic_search,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -243,6 +252,23 @@ def health():
 
 # 10 minute cache, max 100 items
 _estimate_cache = TTLCache(maxsize=100, ttl=600)
+
+
+class PolarisSearchRequest(BaseModel):
+    query: str = Field(..., min_length=2)
+    top_k: int = Field(10, ge=1, le=50)
+    min_spots: int | None = Field(default=None, ge=0)
+    require_garage: bool = False
+    require_street: bool = False
+
+
+ATLANTA_POLARIS_BBOX = {
+    "min_lat": 33.647,
+    "max_lat": 33.886,
+    "min_lon": -84.552,
+    "max_lon": -84.289,
+    "resolution": 9,
+}
 
 def _estimate_cache_key(lat: float, lon: float, radius: int):
     # cache key rounds to 3 decimal places (~111m) so nearby requests reuse cache
@@ -465,6 +491,117 @@ def macro(
         "grid": grid_features,
         "elapsed_seconds": elapsed
     }
+
+
+@app.post("/api/polaris/index")
+async def polaris_index():
+    """
+    Build/refresh the Polaris semantic index from Atlanta macro parking cells.
+    """
+    t_start = time.time()
+
+    macro_result = macro(
+        min_lat=ATLANTA_POLARIS_BBOX["min_lat"],
+        min_lon=ATLANTA_POLARIS_BBOX["min_lon"],
+        max_lat=ATLANTA_POLARIS_BBOX["max_lat"],
+        max_lon=ATLANTA_POLARIS_BBOX["max_lon"],
+        resolution=ATLANTA_POLARIS_BBOX["resolution"],
+    )
+
+    if macro_result.get("status") == 400:
+        raise HTTPException(
+            status_code=400,
+            detail=macro_result.get("error", "Failed to build macro hex grid."),
+        )
+
+    grid = macro_result.get("grid", [])
+    if not grid:
+        raise HTTPException(
+            status_code=500,
+            detail="Macro indexing returned an empty grid; nothing to index.",
+        )
+
+    try:
+        indexed_cells = await index_hex_cells(grid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Polaris index build failed.")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to build Polaris index: {exc}"
+        ) from exc
+
+    return {
+        "status": "ok",
+        "indexed_cells": indexed_cells,
+        "hex_count": len(grid),
+        "elapsed_seconds": round(time.time() - t_start, 2),
+        "bbox": [
+            ATLANTA_POLARIS_BBOX["min_lat"],
+            ATLANTA_POLARIS_BBOX["min_lon"],
+            ATLANTA_POLARIS_BBOX["max_lat"],
+            ATLANTA_POLARIS_BBOX["max_lon"],
+        ],
+        "resolution": ATLANTA_POLARIS_BBOX["resolution"],
+    }
+
+
+@app.post("/api/polaris/search")
+async def polaris_search(request: PolarisSearchRequest):
+    """
+    Semantic search over indexed Atlanta parking hex cells.
+    """
+    status = await get_vector_index_status()
+    if not status.get("db_ready"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Actian VectorAI DB is not ready. "
+                f"Details: {status.get('error', 'health check failed')}"
+            ),
+        )
+    if int(status.get("indexed_count", 0)) <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No cells are indexed yet. Run POST /api/polaris/index first.",
+        )
+
+    try:
+        results = await semantic_search(
+            query=request.query,
+            top_k=request.top_k,
+            min_spots=request.min_spots,
+            require_garage=request.require_garage,
+            require_street=request.require_street,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Polaris semantic search failed.")
+        raise HTTPException(
+            status_code=500, detail=f"Polaris semantic search failed: {exc}"
+        ) from exc
+
+    return {
+        "status": "ok",
+        "query": request.query,
+        "top_k": request.top_k,
+        "filters": {
+            "min_spots": request.min_spots,
+            "require_garage": request.require_garage,
+            "require_street": request.require_street,
+        },
+        "result_count": len(results),
+        "results": results,
+    }
+
+
+@app.get("/api/polaris/status")
+async def polaris_status():
+    """
+    Vector DB readiness and current indexed cell count.
+    """
+    return await get_vector_index_status()
 
 
 if __name__ == "__main__":
