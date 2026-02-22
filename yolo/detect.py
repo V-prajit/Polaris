@@ -432,8 +432,8 @@ class YOLOParkingDetector:
             for pred in all_preds:
                 cat_name = pred.category.name.lower()
                 if any(v in cat_name for v in ["car", "van", "truck", "bus"]):
-                    # Filter confidence >= 0.35 to balance false positives and recall
-                    if pred.score.value >= 0.35:
+                    # Keep threshold aligned with configured car confidence.
+                    if pred.score.value >= conf:
                         box = pred.bbox
                         formatted_boxes.append((pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value))
                     
@@ -578,12 +578,12 @@ class YOLOParkingDetector:
                 + result3.object_prediction_list
             )
 
-            # Filter to vehicle classes, confidence >= 0.35
+            # Filter to vehicle classes using configured confidence threshold.
             formatted_boxes = []
             for pred in all_preds:
                 cat_name = pred.category.name.lower()
                 if any(v in cat_name for v in ["car", "van", "truck", "bus"]):
-                    if pred.score.value >= 0.35:
+                    if pred.score.value >= conf:
                         box = pred.bbox
                         formatted_boxes.append(
                             (pred, box.minx, box.miny, box.maxx, box.maxy, pred.score.value)

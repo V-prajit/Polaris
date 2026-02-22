@@ -72,9 +72,9 @@ _car_detector = None
 
 # Synthetic scan tuning for places where OSM has no surface lot polygons.
 # Keep this small so inference stays fast and map scale remains usable.
-_SYNTHETIC_SCAN_MIN_RADIUS_M = 40
-_SYNTHETIC_SCAN_MAX_RADIUS_M = 80
-_SYNTHETIC_SCAN_RADIUS_FACTOR = 0.20
+_SYNTHETIC_SCAN_MIN_RADIUS_M = 75
+_SYNTHETIC_SCAN_MAX_RADIUS_M = 140
+_SYNTHETIC_SCAN_RADIUS_FACTOR = 0.40
 
 # Convert detected cars to a conservative capacity estimate in synthetic mode.
 _SYNTHETIC_CAPACITY_MULTIPLIER = 1.6
@@ -134,10 +134,15 @@ def _get_car_detector():
 def _get_segmenter():
     global _segmenter
     if _segmenter is None:
-        ckpt = PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model"
-        if not ckpt.exists():
-            ckpt = PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model"
-        if not ckpt.exists():
+        candidate_ckpts = [
+            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
+            PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
+            PROJECT_ROOT / "checkpoints" / "best_model",
+            PROJECT_ROOT / "models" / "segformer_best",
+            PROJECT_ROOT / "models" / "best_model",
+        ]
+        ckpt = next((p for p in candidate_ckpts if p.exists()), None)
+        if ckpt is None:
             logger.info("No SegFormer checkpoint found, skipping segmentation stage.")
             return None
         from parksight.segment import ParkingSegmenter
@@ -780,19 +785,41 @@ def macro(
     }
 
 
+class PolarisIndexRequest(BaseModel):
+    min_lat: float | None = None
+    max_lat: float | None = None
+    min_lon: float | None = None
+    max_lon: float | None = None
+    resolution: int = 7
+
+
 @app.post("/api/polaris/index")
-async def polaris_index():
+async def polaris_index(request: PolarisIndexRequest | None = None):
     """
-    Build/refresh the Polaris semantic index from Atlanta macro parking cells.
+    Build/refresh the Polaris semantic index.
+    Accepts optional custom bbox; defaults to full Atlanta.
     """
     t_start = time.time()
 
+    bbox = ATLANTA_POLARIS_BBOX.copy()
+    if request is not None:
+        if request.min_lat is not None:
+            bbox["min_lat"] = request.min_lat
+        if request.max_lat is not None:
+            bbox["max_lat"] = request.max_lat
+        if request.min_lon is not None:
+            bbox["min_lon"] = request.min_lon
+        if request.max_lon is not None:
+            bbox["max_lon"] = request.max_lon
+        if request.resolution:
+            bbox["resolution"] = request.resolution
+
     macro_result = macro(
-        min_lat=ATLANTA_POLARIS_BBOX["min_lat"],
-        min_lon=ATLANTA_POLARIS_BBOX["min_lon"],
-        max_lat=ATLANTA_POLARIS_BBOX["max_lat"],
-        max_lon=ATLANTA_POLARIS_BBOX["max_lon"],
-        resolution=ATLANTA_POLARIS_BBOX["resolution"],
+        min_lat=bbox["min_lat"],
+        min_lon=bbox["min_lon"],
+        max_lat=bbox["max_lat"],
+        max_lon=bbox["max_lon"],
+        resolution=bbox["resolution"],
     )
 
     if macro_result.get("status") == 400:
@@ -823,13 +850,8 @@ async def polaris_index():
         "indexed_cells": indexed_cells,
         "hex_count": len(grid),
         "elapsed_seconds": round(time.time() - t_start, 2),
-        "bbox": [
-            ATLANTA_POLARIS_BBOX["min_lat"],
-            ATLANTA_POLARIS_BBOX["min_lon"],
-            ATLANTA_POLARIS_BBOX["max_lat"],
-            ATLANTA_POLARIS_BBOX["max_lon"],
-        ],
-        "resolution": ATLANTA_POLARIS_BBOX["resolution"],
+        "bbox": [bbox["min_lat"], bbox["min_lon"], bbox["max_lat"], bbox["max_lon"]],
+        "resolution": bbox["resolution"],
     }
 
 

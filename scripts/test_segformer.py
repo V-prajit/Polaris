@@ -31,6 +31,7 @@ def _find_segformer_checkpoint() -> Path | None:
     candidates = [
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg-final" / "best_model",
         PROJECT_ROOT / "checkpoints" / "segformer-b5-parkseg" / "best_model",
+        PROJECT_ROOT / "checkpoints" / "best_model",
         PROJECT_ROOT / "models" / "segformer_best",
         PROJECT_ROOT / "models" / "best_model",
     ]
@@ -121,6 +122,7 @@ def main():
         print("Checked:")
         print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg-final' / 'best_model'}")
         print(f"  - {PROJECT_ROOT / 'checkpoints' / 'segformer-b5-parkseg' / 'best_model'}")
+        print(f"  - {PROJECT_ROOT / 'checkpoints' / 'best_model'}")
         print(f"  - {PROJECT_ROOT / 'models' / 'segformer_best'}")
         print(f"  - {PROJECT_ROOT / 'models' / 'best_model'}")
         sys.exit(1)
