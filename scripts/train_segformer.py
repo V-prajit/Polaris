@@ -242,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--val_split", type=float, default=0.15, help="Validation fraction (default 0.15)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--stall_class_ids", nargs="+", type=int, default=[1, 2, 3], help="ParkSeg12k class IDs to map to 'stall' (default: 1 2 3)")
+    p.add_argument("--stall_class_ids", nargs="+", type=int, default=[255], help="ParkSeg12k class IDs to map to 'stall' (default: 255 — ParkSeg12k uses 0=bg, 255=stall)")
 
     # Model
     p.add_argument("--base_model", type=str, default="nvidia/segformer-b5-finetuned-ade-640-640", help="HuggingFace model ID to start from")
