@@ -60,7 +60,7 @@ function MapDashboardContent() {
   const [locationInfo, setLocationInfo] = useState<GeocodeResult>({ name: "Loading...", address: "" });
   const [layers, setLayers] = useState<Record<string, boolean>>({
     parking: true, roads: true, radius: true, satellite: true, labels: true,
-    model_area: true, model_yolo: false, model_segformer: false,
+    model_area: false, model_yolo: true, model_segformer: false,
   });
 
   // Search bar state
@@ -173,6 +173,10 @@ function MapDashboardContent() {
     () => apiData ? apiData.surface.features.length + apiData.structured.features.length : 0,
     [apiData]
   );
+  const syntheticSurfaceFeature = useMemo(() => {
+    if (!apiData) return null;
+    return apiData.surface.features.find((f) => f.is_synthetic_scan) ?? null;
+  }, [apiData]);
 
   // ML overlay collections — extracted from surface features when ML data is present
   const overlayData = useMemo(() => apiData ? extractOverlayData(apiData) : null, [apiData]);
@@ -377,6 +381,29 @@ function MapDashboardContent() {
                 <MetricPill value={metadata.radius} label="Radius" suffix="m" />
                 <MetricPill value={parkingCount} label="Structures" />
               </motion.div>
+
+              {syntheticSurfaceFeature && (
+                <motion.div
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.46, duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
+                  className="px-4 py-3 border-b border-border/40"
+                >
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                      Synthetic Scan Fallback
+                    </div>
+                    <p className="mt-1 text-[11px] text-amber-100/90 leading-snug">
+                      No OSM surface lot polygon found near this point. Surface capacity is blended from detected cars and a bounded area fallback.
+                    </p>
+                    <div className="mt-2 flex items-center gap-3 text-[10px] text-amber-100/90 tabular-nums">
+                      <span>Scan: {syntheticSurfaceFeature.scan_radius_m ?? "—"}m</span>
+                      <span>Cars: {syntheticSurfaceFeature.cars?.value ?? 0}</span>
+                      <span>Surface Est: {syntheticSurfaceFeature.count}</span>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
 
               {/* Stall Breakdown Chart */}
               {stallItems.length > 0 && (

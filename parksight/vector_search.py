@@ -51,10 +51,41 @@ _GENAI_CONFIGURED = False
 _GENAI_LOCK = asyncio.Lock()
 _POI_CACHE: dict[tuple[float, float], dict[str, int]] = {}
 _POI_CACHE_LOCK = asyncio.Lock()
+_GEOCODE_CACHE: dict[tuple[float, float], str] = {}
+_GEOCODE_CACHE_LOCK = asyncio.Lock()
 
 
 def _vector_db_host() -> str:
     return os.getenv("VECTORDB_HOST", "localhost:50051")
+
+
+def _reverse_geocode_sync(lat: float, lon: float) -> str:
+    """Reverse geocode via Nominatim to get a human-readable location string."""
+    try:
+        params = urllib.parse.urlencode({
+            "lat": lat, "lon": lon, "format": "json", "zoom": 18,
+        })
+        url = f"https://nominatim.openstreetmap.org/reverse?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Polaris/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("display_name", "")
+    except Exception as exc:
+        logger.warning("Reverse geocode failed for (%.5f, %.5f): %s", lat, lon, exc)
+        return ""
+
+
+async def reverse_geocode_cached(lat: float, lon: float) -> str:
+    """Reverse geocode with caching to avoid duplicate Nominatim calls."""
+    cache_key = (round(lat, 4), round(lon, 4))
+    async with _GEOCODE_CACHE_LOCK:
+        cached = _GEOCODE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    result = await asyncio.to_thread(_reverse_geocode_sync, lat, lon)
+    async with _GEOCODE_CACHE_LOCK:
+        _GEOCODE_CACHE[cache_key] = result
+    return result
 
 
 def _require_env(name: str) -> str:
@@ -132,7 +163,9 @@ def _poi_summary_sentence(poi_summary: dict[str, int] | None) -> str:
 
 
 def parking_profile_to_text(
-    hex_cell: dict[str, Any], poi_summary: dict[str, int] | None = None
+    hex_cell: dict[str, Any],
+    poi_summary: dict[str, int] | None = None,
+    location_context: str = "",
 ) -> str:
     """
     Convert one macro hex cell into rich semantic text suitable for embeddings.
@@ -156,8 +189,13 @@ def parking_profile_to_text(
     else:
         location_phrase = "The hex centroid coordinates are not available."
 
+    location_ctx = ""
+    if location_context:
+        location_ctx = f"This area is located near {location_context}. "
+
     return (
         f"Atlanta parking cell {hex_id}. "
+        f"{location_ctx}"
         f"Estimated total parking capacity is {total} spots. "
         f"Surface parking contributes {surface} spots ({surface_pct} percent). "
         f"Structured garage or underground parking contributes {structured} spots "
@@ -455,7 +493,11 @@ async def _flush_collection_if_supported(client: Any) -> None:
         logger.warning("Vector DB flush failed for %s: %s", VECTOR_COLLECTION, exc)
 
 
-async def index_hex_cells(hex_cells: list[dict[str, Any]], batch_size: int = 24) -> int:
+async def index_hex_cells(
+    hex_cells: list[dict[str, Any]],
+    batch_size: int = 24,
+    location_hint: str = "",
+) -> int:
     """
     Embed and index macro hex cells into Actian VectorAI DB.
     """
@@ -484,7 +526,15 @@ async def index_hex_cells(hex_cells: list[dict[str, Any]], batch_size: int = 24)
         else:
             poi_summary = await fetch_nearby_poi_counts(lat, lon)
 
-        profile_text = parking_profile_to_text(hex_cell, poi_summary)
+        # Build location context: combine user-provided hint with reverse geocode
+        geo_address = ""
+        if lat is not None and lon is not None:
+            geo_address = await reverse_geocode_cached(lat, lon)
+        location_context = location_hint
+        if geo_address:
+            location_context = f"{location_hint}. {geo_address}" if location_hint else geo_address
+
+        profile_text = parking_profile_to_text(hex_cell, poi_summary, location_context=location_context)
         vector = await embed_text(profile_text, task_type="RETRIEVAL_DOCUMENT")
 
         ids.append(_vector_id_for_hex(hex_id))

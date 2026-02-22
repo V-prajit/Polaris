@@ -976,6 +976,7 @@ class PolarisIndexRequest(BaseModel):
     min_lon: float | None = None
     max_lon: float | None = None
     resolution: int = 7
+    location_hint: str | None = None
 
 
 @app.post("/api/polaris/index")
@@ -1020,8 +1021,10 @@ async def polaris_index(request: PolarisIndexRequest | None = None):
             detail="Macro indexing returned an empty grid; nothing to index.",
         )
 
+    location_hint = (request.location_hint or "") if request else ""
+
     try:
-        indexed_cells = await index_hex_cells(grid)
+        indexed_cells = await index_hex_cells(grid, location_hint=location_hint)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:

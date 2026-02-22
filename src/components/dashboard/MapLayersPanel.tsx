@@ -22,8 +22,8 @@ const LAYER_GROUPS: { title: string; layers: LayerToggle[] }[] = [
     {
         title: "MODEL OVERLAYS",
         layers: [
-            { id: "model_area", label: "Math Heuristics", icon: <Layers className="w-3.5 h-3.5" />, defaultOn: true, radioGroup: "model" },
-            { id: "model_yolo", label: "YOLO V11", icon: <Eye className="w-3.5 h-3.5" />, defaultOn: false, radioGroup: "model" },
+            { id: "model_area", label: "Math Heuristics", icon: <Layers className="w-3.5 h-3.5" />, defaultOn: false, radioGroup: "model" },
+            { id: "model_yolo", label: "YOLO V11", icon: <Eye className="w-3.5 h-3.5" />, defaultOn: true, radioGroup: "model" },
             { id: "model_segformer", label: "Segformer", icon: <Layers className="w-3.5 h-3.5" />, defaultOn: false, radioGroup: "model" },
         ],
     },
