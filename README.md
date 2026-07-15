@@ -1,154 +1,236 @@
 # Polaris - Satellite-Powered Parking Intelligence
 
-> **Winner - GrowthFactor Challenge @ [Hacklytics 2026](https://hacklytics-2026.devpost.com/) (Georgia Tech, Feb 20-22)**
+Polaris turns a lat/lon into a parking-capacity estimate. Drop a pin anywhere in Atlanta and it pulls satellite imagery plus OpenStreetMap data, runs it through a segmentation model, an object detector, and a geometric heuristic, and returns a stall count with a confidence interval and a composite "Polaris Score" for parking accessibility - covering surface lots, garages, underground structures, and street parking.
 
-**Polaris** is a scalable ML platform that quantifies parking inventory from space. Drop a pin anywhere in Atlanta, and in under 2 seconds it parses satellite imagery to deliver stall counts, confidence intervals, and a **0-100 Polaris Score** for parking accessibility - across surface lots, parking garages, underground structures, and street parking.
+**Status:** Hackathon project (built in 36 hours, light polish after). Not deployed long-term; the systemd/Vultr setup described below was used for the demo period and is not guaranteed to be running.
 
-We chose **Track B (City-Wide Mapping)** and mapped the **entirety of Atlanta**, generating a comprehensive parking heatmap across the metro area using H3 hexagonal grids.
-
-[Devpost](https://devpost.com/software/parasite-2dri43) | [GitHub](https://github.com/V-prajit/Polaris)
+**Winner - GrowthFactor Challenge at [Hacklytics 2026](https://hacklytics-2026.devpost.com/)** (Georgia Tech, Feb 20-22, 2026). [Devpost writeup](https://devpost.com/software/parasite-2dri43).
 
 ---
 
 ## Table of Contents
 
 - [The Problem](#the-problem)
-- [Our Solution](#our-solution)
+- [What It Does](#what-it-does)
+- [Architecture](#architecture)
+- [Estimation Pipeline](#estimation-pipeline)
 - [Three Detection Approaches](#three-detection-approaches)
 - [Beyond Surface Lots](#beyond-surface-lots)
+- [Sample Output](#sample-output)
 - [Tech Stack](#tech-stack)
-- [Getting Started](#getting-started)
+- [Setup](#setup)
+- [Usage](#usage)
 - [API Reference](#api-reference)
-- [Benchmarks](#benchmarks)
+- [Testing / Evaluation](#testing--evaluation)
+- [Deployment](#deployment)
+- [Known Limitations](#known-limitations)
+- [Repository Hygiene Notes](#repository-hygiene-notes)
 - [Hackathon Context](#hackathon-context)
-- [Team](#team)
+- [Contributions](#contributions)
 - [License](#license)
 
 ---
 
 ## The Problem
 
-Retailers need to know one deceptively simple thing: *how much parking is available near their locations?*
+Retailers and real-estate decision-makers often need to know how much parking exists near a given location. Getting that answer today means manual surveys or stale proprietary datasets. Satellite imagery is abundant and current, but turning raw pixels into an accurate stall count is not a solved problem, and a lot of real-world parking (garages, underground structures, street parking) isn't visible from above at all.
 
-Today, answering this question requires expensive manual surveys or proprietary datasets that are instantly stale. Satellite imagery is abundant, high-resolution, and constantly updated - but turning raw pixels into accurate parking spot counts is an unsolved data science challenge.
+GrowthFactor, a company building software for retail and real-estate decision-makers, sponsored this problem at Hacklytics 2026.
 
-**GrowthFactor**, a company that builds software for retail and real estate decision-makers, sponsored this challenge at Hacklytics 2026. Parking availability is one of the most requested - and hardest to obtain - data points their customers ask about.
+## What It Does
 
----
+Given a coordinate and a search radius, Polaris returns:
 
-## Our Solution
+- Surface-lot stall counts from three independent methods (segmentation, object detection, geometry), reconciled into one estimate with a confidence band
+- Structured-parking estimates (garages, underground) derived from OSM building metadata, since these aren't visible in satellite imagery
+- Street-parking estimates from curb length and OSM lane tags
+- A city-wide heatmap mode that runs the same pipeline over an H3 hexagonal grid across Atlanta
+- A semantic search endpoint over the indexed grid ("areas with lots of garage parking near restaurants") backed by Gemini embeddings and a vector database
 
-Polaris attacks the problem from three angles simultaneously, then fuses the results:
+## Architecture
 
-1. **SegFormer-b5** - Fine-tuned on the [ParkSeg12k](https://github.com/UTEL-UIUC/ParkSeg12k) dataset (12,617 satellite image/mask pairs across 45 US cities) for pixel-level parking lot segmentation
-2. **YOLOv8 / YOLO11** - Detects individual parking stalls and vehicles from satellite tiles using SAHI (Slicing Aided Hyper Inference) for small-object detection
-3. **Geometric Heuristics** - Uses OSM polygon boundaries + ITE/NPA parking design standards (angle-specific aisle widths, OBB layout simulation) to estimate capacity from lot geometry alone - near instant and highly accurate
+```mermaid
+flowchart LR
+    subgraph Client["Browser"]
+        UI["Next.js app (App Router)\nLeaflet map + globe UI"]
+    end
 
-For structured parking invisible from above (garages, underground, street parking), we supplement with **OpenStreetMap metadata**, building height data, and municipal records.
+    subgraph Frontend["Next.js server (same process)"]
+        Routes["/api/estimate, /api/polaris/*\n(Next.js route handlers, thin proxy)"]
+    end
 
-The final estimate is a **weighted ensemble** of all methods, producing confidence intervals and the **Polaris Score** - a 0-100 composite metric for parking accessibility.
+    subgraph Backend["FastAPI backend (api/app.py)"]
+        Estimate["/api/estimate"]
+        Macro["/api/macro"]
+        Index["/api/polaris/index"]
+        Search["/api/polaris/search"]
+    end
 
----
+    subgraph Pipeline["parksight/ pipeline"]
+        Fetch["fetch.py\nOSM + Esri satellite tiles"]
+        Seg["segment.py\nSegFormer-b5"]
+        Det["detect.py\nYOLOv8 / YOLO11 + SAHI"]
+        Geo["estimate_structured.py\nGeometric heuristics"]
+        Conf["confidence.py\nensemble + confidence bands"]
+    end
+
+    subgraph External["External services"]
+        Esri["Esri World Imagery tiles"]
+        OSM["OpenStreetMap / Overpass"]
+        Gemini["Google Gemini embeddings"]
+        VectorDB["Actian VectorAI DB (Docker)"]
+        GPU["Brev.dev GPU node\n(SegFormer/YOLO inference)"]
+    end
+
+    UI --> Routes
+    Routes -->|"BACKEND_URL"| Estimate
+    Routes --> Macro
+    Routes --> Index
+    Routes --> Search
+
+    Estimate --> Fetch
+    Macro --> Fetch
+    Fetch --> Esri
+    Fetch --> OSM
+    Fetch --> Seg
+    Fetch --> Det
+    Fetch --> Geo
+    Seg --> Conf
+    Det --> Conf
+    Geo --> Conf
+    Seg -.->|"model inference"| GPU
+    Det -.->|"model inference"| GPU
+
+    Index --> Gemini
+    Index --> VectorDB
+    Search --> Gemini
+    Search --> VectorDB
+```
+
+**Uncertainty:** the frontend calls the backend through `BACKEND_URL` (see `src/app/api/*/route.ts`), which in `.env.production` points at a Brev.dev GPU hostname used during the hackathon demo window. Whether that node (or any deployed instance) is still running is unconfirmed - see [Deployment](#deployment).
+
+## Estimation Pipeline
+
+This is the per-request flow inside `/api/estimate` (`api/app.py`), showing how the three detection methods and the "invisible from space" categories combine into one response.
+
+```mermaid
+flowchart TD
+    Start(["lat, lon, radius"]) --> OSMQuery["Query OSM for parking polygons\nin radius (surface tags)"]
+    OSMQuery --> HasSurface{"Surface polygons\nfound?"}
+    HasSurface -->|"no"| Synthetic["Create synthetic scan polygon\n(fallback so detectors still run)"]
+    HasSurface -->|"yes"| Tile
+    Synthetic --> Tile["Fetch Esri satellite tile\nfor each polygon"]
+
+    Tile --> SegFormer["SegFormer-b5 segmentation\n+ TTA + morphological cleanup\n+ connected-component count"]
+    Tile --> YOLO["YOLO stall + vehicle detection\n(SAHI tiled inference)"]
+    Tile --> Geometric["OBB layout simulation\n(ITE/NPA aisle-width standards)"]
+
+    SegFormer --> Ensemble["Weighted ensemble\n+ confidence interval"]
+    YOLO --> Ensemble
+    Geometric --> Ensemble
+    Ensemble --> SurfaceResult["Surface-lot result"]
+
+    OSMQuery --> StructQuery["Query OSM for garages /\nunderground structures"]
+    StructQuery --> StructFormula["floor_area * levels * 0.6 usable\n/ 15.5 sq m per stall"]
+    StructFormula --> StructResult["Structured-parking result"]
+
+    OSMQuery --> StreetQuery["Query OSM street\nparking lane tags"]
+    StreetQuery --> StreetFormula["curb_length * 0.8 usable\n/ 5.5 m per car * sides"]
+    StreetFormula --> StreetResult["Street-parking result"]
+
+    SurfaceResult --> Total["grand_total + Polaris Score\n+ aggregate confidence band"]
+    StructResult --> Total
+    StreetResult --> Total
+    Total --> Response(["JSON response to frontend"])
+```
 
 ## Three Detection Approaches
 
-### 1. SegFormer-b5 - Semantic Segmentation
+### 1. SegFormer-b5 - semantic segmentation
 
-Fine-tuned `nvidia/segformer-b5-finetuned-ade-640-640` on the **ParkSeg12k** dataset to produce pixel-level parking masks. The pipeline:
+Fine-tuned `nvidia/segformer-b5-finetuned-ade-640-640` on the [ParkSeg12k](https://github.com/UTEL-UIUC/ParkSeg12k) dataset (12,617 satellite image/mask pairs across 45 US cities) for pixel-level parking masks.
 
-- Fetches 512×512 Esri satellite tiles at zoom 19
-- Runs SegFormer inference with **test-time augmentation** (4 orientations averaged)
-- Applies morphological postprocessing (close > open > filter)
-- Counts stalls via **connected-component analysis** with area thresholds (400-12,000 px)
-- Falls back to **area-based estimation** using real-world stall dimensions (15.5 m2/stall)
+- Fetches 512x512 Esri satellite tiles at zoom 19
+- Runs inference with test-time augmentation (4 orientations averaged)
+- Morphological postprocessing (close, then open, then filter)
+- Counts stalls via connected-component analysis with area thresholds (400-12,000 px)
+- Falls back to area-based estimation using real-world stall dimensions (15.5 sq m/stall) when connected components aren't separable
 
-**Strengths:** Extremely accurate lot boundary detection, works across diverse geographies  
-**Weaknesses:** Computationally expensive, struggles to differentiate adjacent stalls
+Strong at lot-boundary detection and generalizes across geographies; expensive to run and struggles to separate adjacent stalls.
 
-### 2. YOLO - Object Detection
+### 2. YOLO - object detection
 
-Two YOLO models run in parallel:
+Two models run in parallel, both using SAHI (Slicing Aided Hyper Inference) to handle small object sizes in satellite tiles:
 
 | Model | Purpose | Dataset |
 |-------|---------|---------|
-| **Custom ParkSeg YOLO** | Detect individual parking stalls | Trained on ParkSeg12k + APKLOT |
-| **YOLOv8s-VisDrone** | Detect and count vehicles | Pre-trained on VisDrone aerial dataset |
+| Custom ParkSeg YOLO | Detect individual parking stalls | Trained on ParkSeg12k + APKLOT |
+| YOLOv8s-VisDrone | Detect and count vehicles | Pre-trained on VisDrone aerial dataset |
 
-Both use **SAHI** (Slicing Aided Hyper Inference) to handle the small object sizes inherent in satellite imagery. Optimal configuration after grid search: `slice_size=256×256, overlap_ratio=0.4` (MAE of 6.0 vehicles per region).
+Grid search settled on `slice_size=256x256, overlap_ratio=0.4` (MAE 6.0 vehicles per region, see [Testing / Evaluation](#testing--evaluation)). Fast, and directly counts individual stalls and vehicles; loses precision on densely packed lots.
 
-**Strengths:** Fast inference, directly counts individual stalls and vehicles  
-**Weaknesses:** Lower precision on densely packed lots
+### 3. Geometric heuristics - layout simulation
 
-### 3. Geometric Heuristics - Layout Simulation
+No ML involved. Uses OSM polygon boundaries plus parking-engineering standards:
 
-No ML required. Uses OSM polygon boundaries and parking engineering standards:
+- OBB-based layout simulation fits parking rows at 45, 60, and 90 degree angles, using angle-specific aisle widths from ITE/NPA standards (7.3m at 90 degrees, 5.5m at 60, 4.0m at 45)
+- Aspect-ratio detection switches narrow lots to parallel/single-loaded layouts automatically
+- Solidity scoring (convex-hull ratio) penalizes irregular shapes
+- Blends with OSM `capacity` tags when present
 
-- **OBB-based layout simulation** - Fits parking rows at 45, 60, and 90 degree angles with angle-specific aisle widths (ITE/NPA standards: 7.3m for 90, 5.5m for 60, 4.0m for 45)
-- **Aspect-ratio detection** - Narrow lots automatically switch to parallel/single-loaded layouts
-- **Solidity scoring** - Uses convex hull ratio to penalize irregular shapes
-- **OSM capacity blending** - When available, blends geometrically estimated values with official OSM `capacity` tags
-
-**Strengths:** Near-instant, highly accurate for regular lots, no GPU needed  
-**Weaknesses:** Struggles with irregular shapes and lots without OSM boundaries
-
----
+Near-instant, no GPU needed, accurate for regular lots; weak on irregular shapes without OSM boundary data.
 
 ## Beyond Surface Lots
 
-A key differentiator of Polaris is handling parking that satellites **cannot see**:
+Satellites can't see structured or street parking, so Polaris estimates these from metadata instead:
 
-| Type | Method | Data Source |
+| Type | Method | Data source |
 |------|--------|-------------|
-| **Parking Garages** | Floor area x levels x 60% usable fraction / 15.5 m2/stall | OSM `building:levels`, `parking:levels` tags |
-| **Underground** | Same formula, defaults to 2 levels if tag missing | OSM `parking=underground` |
-| **Street Parking** | Curb length x 80% usable / 5.5m avg car length x sides | OSM `parking:lane`, `parking:left/right/both` tags |
+| Parking garages | floor area x levels x 60% usable / 15.5 sq m per stall | OSM `building:levels`, `parking:levels` |
+| Underground | Same formula, defaults to 2 levels if the tag is missing | OSM `parking=underground` |
+| Street parking | curb length x 80% usable / 5.5m avg car length x sides | OSM `parking:lane`, `parking:left/right/both` |
 
-When OSM has a `capacity` tag, estimates are **blended** (60% OSM + 40% geometric) for higher accuracy.
+When an OSM `capacity` tag exists, the estimate is blended (60% OSM + 40% geometric).
 
----
+## Sample Output
+
+Existing repo images from development/evaluation (not fabricated for this README):
+
+**512x512 patch comparison across five US cities** (`patch_comparisons.png`) - satellite tile vs. YOLOv11 stall/vehicle boxes vs. SegFormer-B5 segmentation mask, side by side:
+
+![Patch comparisons across Atlanta, LA, Chicago, Houston, Phoenix](patch_comparisons.png)
+
+**Detection overlay on a single tile** (`visual_comparison.png`) - original image, all detections after 2-pass inference + NMS, and vehicles-only:
+
+![Detection overlay: original, all detections, cars only](visual_comparison.png)
 
 ## Tech Stack
 
 ### Backend (Python 3.13+)
-| Component | Technology |
-|-----------|-----------|
-| API Framework | **FastAPI** + Uvicorn |
-| Segmentation | **SegFormer-b5** (HuggingFace Transformers) |
-| Object Detection | **Ultralytics YOLO** (v8 + v11) |
-| Geospatial | **OSMnx**, GeoPandas, Shapely, PyProj |
-| Satellite Tiles | **Contextily** (Esri World Imagery) |
-| Image Processing | OpenCV, Pillow, NumPy |
-| Vector Search | **Actian VectorAI DB** + Gemini Embeddings |
-| Caching | TTLCache (in-memory) + disk tile cache |
+- FastAPI + Uvicorn
+- SegFormer-b5 (HuggingFace Transformers) for segmentation
+- Ultralytics YOLO (v8 + v11) for detection
+- OSMnx, GeoPandas, Shapely, PyProj for geospatial queries
+- Contextily for Esri World Imagery satellite tiles
+- OpenCV, Pillow, NumPy for image processing
+- Actian VectorAI DB + Gemini embeddings for semantic search
+- TTLCache (in-memory) plus a disk tile cache
 
 ### Frontend (TypeScript)
-| Component | Technology |
-|-----------|-----------|
-| Framework | **Next.js 16** (App Router) |
-| UI | React 19, Tailwind CSS 4, Framer Motion |
-| Maps | **Leaflet** + React-Leaflet |
-| Components | Radix UI, Lucide Icons |
-| Globe | **COBE** (WebGL globe) |
+- Next.js 16 (App Router), React 19
+- Tailwind CSS 4, Framer Motion, Radix UI, Lucide icons
+- Leaflet + React-Leaflet for the map view
+- COBE for the WebGL landing-page globe
 
-### Infrastructure
-| Component | Technology |
-|-----------|-----------|
-| GPU Inference | **Brev.dev** (H200 node) |
-| Hosting | **Vultr** VPS (systemd services) |
-| Vector Database | **Actian VectorAI DB** (Docker) |
-| Embeddings | **Google Gemini** (`text-embedding-004`, 768d) |
+### Infrastructure (hackathon demo, not guaranteed to still be live)
+- GPU inference on a Brev.dev H200 node
+- Hosting on a Vultr VPS via systemd services (see `scripts/deploy_vultr.sh`)
+- Actian VectorAI DB running in Docker
+- Google Gemini (`text-embedding-004` / `gemini-embedding-001`, 768d) for embeddings
 
+## Setup
 
-## Getting Started
-
-### Prerequisites
-
-- **Python 3.13+** (with `uv` or `pip`)
-- **Node.js 20+** (LTS)
-- **Docker** (for Actian VectorAI DB, optional)
-- **GPU recommended** for SegFormer/YOLO inference (CUDA or MPS)
-
-### 1. Clone & Install
+Prerequisites: Python 3.13+, Node.js 20+ LTS, Docker (optional, only needed for the vector-search feature), and a GPU (CUDA or MPS) if you want SegFormer/YOLO inference at a usable speed - it will run on CPU but slowly.
 
 ```bash
 git clone https://github.com/V-prajit/Polaris.git
@@ -159,55 +241,43 @@ pip install -r requirements.txt
 # or with uv:
 uv sync
 
-# Frontend dependencies
+# Frontend dependencies (root package.json is the active Next.js app - see hygiene note below)
 npm install
 ```
 
-### 2. Environment Variables
+Environment variables - copy the template and fill in your own keys, do not commit real values:
 
 ```bash
 cp .env.production .env
 ```
 
-Edit `.env` and add your API keys:
-
 ```env
-GEMINI_API_KEY=your_gemini_key        # For semantic search embeddings
-GOOGLE_MAPS_API_KEY=your_maps_key     # For POI enrichment (optional)
-BACKEND_URL=http://localhost:8000      # API URL
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE        # semantic search embeddings
+GOOGLE_MAPS_API_KEY=YOUR_GOOGLE_MAPS_API_KEY_HERE  # optional, POI enrichment
+BACKEND_URL=http://localhost:8000               # FastAPI backend URL the frontend proxies to
 ```
 
-### 3. Start the Vector Database (optional)
+Optional - start the vector database for the semantic-search endpoint:
 
 ```bash
 docker-compose up -d
 ```
 
-### 4. Run the API
+## Usage
+
+Run the API:
 
 ```bash
 uvicorn api.app:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
-### 5. Run the Frontend
+Run the frontend:
 
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) - you'll see the Polaris globe. Search for any Atlanta location to get a parking analysis.
-
-### Production Deployment
-
-For a one-click deployment on a Vultr VPS:
-
-```bash
-bash scripts/deploy_vultr.sh
-```
-
-This sets up systemd services for both the API and frontend, configures the firewall, and starts the VectorAI DB container.
-
----
+Open [http://localhost:3000](http://localhost:3000), search for a location, and it returns a parking breakdown for that area. First-run model loading (SegFormer/YOLO checkpoints) adds latency to the first request.
 
 ## API Reference
 
@@ -216,28 +286,28 @@ This sets up systemd services for both the API and frontend, configures the fire
 Point-level parking analysis for a single location.
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `lat` | float | *required* | Latitude (WGS84) |
-| `lon` | float | *required* | Longitude (WGS84) |
+|-----------|------|---------|--------------|
+| `lat` | float | required | Latitude (WGS84) |
+| `lon` | float | required | Longitude (WGS84) |
 | `radius` | int | 300 | Search radius in metres (50-2000) |
 
-**Returns:** Surface lots with stall counts (SegFormer + YOLO + geometric), structured parking estimates, street parking estimates, confidence intervals, segmentation mask contours (GeoJSON), and the Polaris Score.
+Returns surface lots (stall counts from SegFormer + YOLO + geometry), structured-parking estimates, street-parking estimates, confidence intervals, segmentation-mask contours (GeoJSON), and the Polaris Score.
 
 ### `GET /api/macro`
 
-City-wide parking heatmap using H3 hexagonal grid.
+City-wide parking heatmap over an H3 hexagonal grid.
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `min_lat`, `max_lat` | float | *required* | Bounding box latitude |
-| `min_lon`, `max_lon` | float | *required* | Bounding box longitude |
-| `resolution` | int | 9 | H3 grid resolution (9 = ~170m radius hexagons) |
+|-----------|------|---------|--------------|
+| `min_lat`, `max_lat` | float | required | Bounding-box latitude |
+| `min_lon`, `max_lon` | float | required | Bounding-box longitude |
+| `resolution` | int | 9 | H3 grid resolution (9 is roughly 170m-radius hexagons) |
 
-**Returns:** Array of H3 hexagon cells, each with parking capacity estimates and metadata.
+Returns an array of H3 cells, each with a parking-capacity estimate and metadata.
 
 ### `POST /api/polaris/search`
 
-Semantic search over indexed parking profiles using natural language.
+Semantic search over the indexed grid.
 
 ```json
 {
@@ -248,92 +318,78 @@ Semantic search over indexed parking profiles using natural language.
 }
 ```
 
-**Returns:** Top-K matching hex cells ranked by semantic similarity via Gemini embeddings and Actian VectorAI DB.
+Returns the top-K matching hex cells ranked by embedding similarity (Gemini embeddings, Actian VectorAI DB).
 
----
+`POST /api/polaris/index` and `GET /api/polaris/status` build and check the semantic index; `GET /api/health` is a liveness check.
 
-## Benchmarks
+## Testing / Evaluation
 
-### Method Comparison - Atlanta Test Locations
+There's no automated test suite (no CI workflow in the repo) - validation was empirical, done during the hackathon against a small set of hand-counted locations.
+
+**Method comparison** (`Benchmark.md`), three Atlanta lots, area heuristic vs. edge detection vs. geometric vs. YOLO spots vs. YOLO cars-via-SAHI:
 
 ```
-Georgia Tech, Atlanta (33.7756, -84.3963)
-----------------------------------------------
-  Lot #301779 (3,396 m2)
-    Area heuristic:    109  [81-142]
-    Edge detection:     31
-    Geometric:          65  [52-82]
-    YOLO spots:         84
-    YOLO cars (SAHI):    7  [5-9]
+Georgia Tech, Atlanta - Lot #301779 (3,396 sq m)
+  Area heuristic:    109  [81-142]
+  Geometric:          65  [52-82]
+  YOLO spots:         84
+  YOLO cars (SAHI):    7  [5-9]
 
-Atlantic Station, Atlanta (33.757, -84.4015)
-----------------------------------------------
-  Lot #800491500 (6,478 m2)
-    Area heuristic:    208  [156-271]
-    Geometric:         122  [97-152]
-    YOLO spots:         87
-    YOLO cars (SAHI):    2  [1-2]
+Atlantic Station, Atlanta - Lot #800491500 (6,478 sq m)
+  Area heuristic:    208  [156-271]
+  Geometric:         122  [97-152]
+  YOLO spots:         87
+  YOLO cars (SAHI):    2  [1-2]
 ```
 
-The best results come from averaging **YOLO spot detection** with the **SegFormer-informed geometric heuristic**, while other methods serve as validation cross-checks.
+The repo notes that averaging YOLO spot detection with the SegFormer-informed geometric heuristic gave the best results; the other methods served as validation cross-checks, not production inputs.
 
-### Vehicle Detection Accuracy (SAHI Tuning)
+**Vehicle-detection SAHI tuning** (`short_summary.md`), manual ground-truth counts vs. the VisDrone-pretrained YOLO baseline at two slice configurations:
 
-| Location | Ground Truth | Baseline (128x128) | Tuned (256x256) |
+| Location | Manual count | Baseline (128x128 slices) | Tuned (256x256 slices) |
 |----------|:---:|:---:|:---:|
 | Atlantic Station | ~55 | 73 | 47 |
 | Turner Field Lot | ~27 | 26 | 21 |
 | GT Parking | ~34 | 31 | 30 |
 
-Best SAHI config: `slice=256x256, overlap=0.4` - **MAE: 6.0 vehicles/region**
+Best config: `slice=256x256, overlap=0.4`, MAE 6.0 vehicles/region (down from 7.33 at the default 128/0.3 setting). These numbers are from three hand-counted locations, not a held-out benchmark - treat them as directional, not a rigorous accuracy claim.
 
----
+## Deployment
+
+`scripts/deploy_vultr.sh` is a one-shot provisioning script for a Vultr VPS: installs Python 3.11, Node 20, and Docker, builds the frontend, starts the Actian VectorAI DB container, and installs two systemd services (`parksight-api`, `parksight-web`) pointed at `uvicorn` and `npm start` respectively. It was used to stand up the hackathon demo; there's no evidence in the repo of it being kept running or monitored afterward, so treat any live URL as unverified.
+
+## Known Limitations
+
+- No automated tests or CI - correctness is checked by manual comparison against hand-counted locations, not a regression suite
+- Coverage is effectively Atlanta-only in practice (city-wide H3 indexing and the semantic-search index were built for Atlanta specifically), even though the underlying pipeline takes an arbitrary lat/lon
+- SegFormer and YOLO inference is slow without a GPU; the `.env.production` template assumes a remote GPU backend
+- Synthetic-scan fallback (when OSM has no surface-lot polygons) is a heuristic circle around the query point, not a real lot boundary, so counts in that mode are rougher
+- Structured and street-parking estimates depend entirely on OSM tag completeness/quality; sparse tagging in a given city will understate capacity
+
+## Repository Hygiene Notes
+
+Filed as follow-ups rather than fixed in this PR (docs-only scope):
+
+- The repo is ~2.1GB checked out, most of it three Git LFS model checkpoints (`checkpoints/best_model`, `models/best_model`, `models/segformer_best` - each a SegFormer `model.safetensors`) plus several PNG test outputs and a 6.5MB zoning GeoJSON committed directly (not via LFS). Worth deciding which checkpoint is canonical and whether the others can be dropped.
+- There are two parallel Next.js frontends: the root (`src/`, `package.json`, referenced by `deploy_vultr.sh`) is the one actually built and deployed; `frontend/` is an earlier copy from the same hackathon weekend that appears unused by any script. Worth removing or clearly marking as archived.
+- `.env.production` is committed. Its values are placeholders/non-secret (API_HOST, CORS_ORIGINS, a Brev.dev hostname) with no live keys, but committing a file named like a real env file is worth avoiding going forward - a `.env.production.example` naming convention is safer.
 
 ## Hackathon Context
 
-This project was built in **36 hours** for the **ParkSight** challenge at [Hacklytics 2026](https://hacklytics-2026.devpost.com/) (Georgia Tech, Feb 20-22), sponsored by [GrowthFactor](https://www.growthfactor.ai/).
+Built in 36 hours for the ParkSight challenge at [Hacklytics 2026](https://hacklytics-2026.devpost.com/) (Georgia Tech, Feb 20-22, 2026), sponsored by [GrowthFactor](https://www.growthfactor.ai/). The challenge offered two tracks: Track A (point query - estimate capacity near a lat/lon) and Track B (city-wide mapping - map an entire city, weighted more favorably). The team chose Track B and delivered a full city-wide Atlanta map while also supporting point queries.
 
-### The Challenge
+Data sources used: [ParkSeg12k](https://github.com/UTEL-UIUC/ParkSeg12k) (SegFormer training), [APKLOT](https://github.com/langheran/APKLOT) (YOLO training), [VisDrone](https://github.com/VisDrone/VisDrone-Dataset) (pretrained vehicle detector), Esri World Imagery (satellite tiles via Contextily), OpenStreetMap (parking polygons, building metadata, road networks, capacity tags), and an Atlanta zoning GeoJSON for zoning context.
 
-Build a pipeline that uses satellite or aerial imagery to map and count parking spots. Two tracks were offered:
+## Contributions
 
-- **Track A (Point Query):** Given a lat/long, estimate nearby parking capacity
-- **Track B (City-Wide Mapping):** Generate a comprehensive parking map for an entire city *(more ambitious, weighted favorably)*
+Built by a three-person team over the hackathon weekend, with one small README follow-up commit two days later. By commit count in this repo: Prajit Viswanadha ([@V-prajit](https://github.com/V-prajit), 48 commits), Jeevanandan Ramasamy ([@JeevanandanRamasamy](https://github.com/JeevanandanRamasamy), 19 commits), Shashank Yaji ([@SSKYAJI](https://github.com/SSKYAJI), 14 commits). Commit counts are a rough proxy, not an exact division of labor.
 
-We chose **Track B** and delivered a full city-wide parking map of Atlanta, while also supporting point queries.
+**Prajit's contributions:** the FastAPI backend and `/api/estimate` / `/api/macro` request pipeline, the OSM fetch and structured/street parking formulas, the geometric OBB layout-simulation heuristic, YOLO + SAHI integration and slice-size tuning, the Gemini-embeddings/Actian vector-search indexing and semantic search endpoint, and the Vultr deployment scripts.
 
-### Judging Criteria
+**Team contributions:** SegFormer-b5 fine-tuning and the geometric/solidity-based estimator (Jeevanandan Ramasamy), the Next.js frontend, map dashboard, and UI polish (Shashank Yaji and Jeevanandan Ramasamy).
 
-| Criteria | Weight | Our Approach |
-|----------|:---:|---|
-| **Spot Detection Accuracy** | 40% | Three-method ensemble with confidence intervals, validated against ground truth at 3 Atlanta locations |
-| **Technical Approach** | 25% | SegFormer fine-tuning, YOLO with SAHI, geometric layout simulation using ITE/NPA engineering standards |
-| **Scalability & Generalization** | 20% | City-wide H3 hex mapping, works across different lot types (surface, structured, street) |
-| **Presentation & Insight** | 15% | Interactive globe UI, real-time map dashboard with Polaris Score, semantic search |
-
-### Data Sources Used
-
-- [**ParkSeg12k**](https://github.com/UTEL-UIUC/ParkSeg12k) - 12,617 satellite image/mask pairs for SegFormer training
-- [**APKLOT**](https://github.com/langheran/APKLOT) - 7,000 annotated polygons for YOLO training
-- [**VisDrone**](https://github.com/VisDrone/VisDrone-Dataset) - Aerial vehicle detection dataset (pre-trained model)
-- **Esri World Imagery** - High-res satellite tiles via Contextily
-- **OpenStreetMap** - Parking polygons, building metadata, road networks, capacity tags
-- **Atlanta Zoning Districts** - GeoJSON for zoning context
-
----
-
-## Team
-
-| Name | GitHub |
-|---|---|
-| **Prajit Viswanadha** | [@V-prajit](https://github.com/V-prajit) |
-| **Shashank Yaji** | [@SSKYAJI](https://github.com/SSKYAJI) |
-| **Jeevan Ramasamy** | [@JeevanandanRamasamy](https://github.com/JeevanandanRamasamy) |
-
-**Sponsor Mentor:** Raj - Co-founder at [GrowthFactor](https://www.growthfactor.ai/)
-
----
+**Sponsor mentor:** Raj, co-founder at [GrowthFactor](https://www.growthfactor.ai/).
 
 ## License
 
-[MIT](LICENSE) - Copyright (c) 2026 GrowthFactor, Inc.
+[MIT](LICENSE) - Copyright (c) 2026 GrowthFactor, Inc. (the license file names GrowthFactor as copyright holder; confirm this is intended if the code is meant to be independently reusable outside the hackathon submission).
