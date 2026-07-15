@@ -61,7 +61,7 @@ flowchart LR
 
     subgraph Backend["FastAPI backend (api/app.py)"]
         Estimate["/api/estimate"]
-        Macro["/api/macro"]
+        Macro["/api/macro\n(offline / precompute scripts only,\nnot called by the live frontend)"]
         Index["/api/polaris/index"]
         Search["/api/polaris/search"]
     end
@@ -69,10 +69,11 @@ flowchart LR
     subgraph Pipeline["parksight/ pipeline"]
         Fetch["fetch.py\nOSM + Esri satellite tiles"]
         Seg["segment.py\nSegFormer-b5"]
-        Det["detect.py\nYOLOv8 / YOLO11 + SAHI"]
         Geo["estimate_structured.py\nGeometric heuristics"]
         Conf["confidence.py\nensemble + confidence bands"]
     end
+
+    Det["yolo/detect.py\nYOLOv8 / YOLO11 + SAHI"]
 
     subgraph External["External services"]
         Esri["Esri World Imagery tiles"]
@@ -84,7 +85,6 @@ flowchart LR
 
     UI --> Routes
     Routes -->|"BACKEND_URL"| Estimate
-    Routes --> Macro
     Routes --> Index
     Routes --> Search
 
@@ -108,6 +108,8 @@ flowchart LR
 ```
 
 **Uncertainty:** the frontend calls the backend through `BACKEND_URL` (see `src/app/api/*/route.ts`), which in `.env.production` points at a Brev.dev GPU hostname used during the hackathon demo window. Whether that node (or any deployed instance) is still running is unconfirmed - see [Deployment](#deployment).
+
+**Note:** the YOLO+SAHI detector (`yolo/detect.py`, imported by `api/app.py` as `YOLOParkingDetector`) is a separate top-level package, not part of `parksight/`. `parksight/detect.py` also exists but is a different, unused component - see [Three Detection Approaches](#three-detection-approaches).
 
 ## Estimation Pipeline
 
@@ -167,7 +169,11 @@ Two models run in parallel, both using SAHI (Slicing Aided Hyper Inference) to h
 | Custom ParkSeg YOLO | Detect individual parking stalls | Trained on ParkSeg12k + APKLOT |
 | YOLOv8s-VisDrone | Detect and count vehicles | Pre-trained on VisDrone aerial dataset |
 
-Grid search settled on `slice_size=256x256, overlap_ratio=0.4` (MAE 6.0 vehicles per region, see [Testing / Evaluation](#testing--evaluation)). Fast, and directly counts individual stalls and vehicles; loses precision on densely packed lots.
+Note: the vehicle detector named here (YOLOv8s-VisDrone) is the one documented in `short_summary.md`. `api/app.py` loads `models/yolo_aerial_cars.pt` at runtime, and the separate tuning notes in `Benchmark.md` report numbers from a `COCO yolo11n` car detector - different vehicle-detector experiments are referenced across the repo's docs, so figures from different files aren't guaranteed to be the same underlying model.
+
+A slice-size sweep found `256x256` slices with `overlap_ratio=0.4` best in offline evaluation (MAE 6.0 vehicles per region, see [Testing / Evaluation](#testing--evaluation) and `short_summary.md`); this was a tuning result, not the deployed config. The runtime detector (`yolo/detect.py`) uses `128x128` slices with `overlap_ratio=0.25` across a 3-pass test-time-augmentation ensemble (original, inverted, brightened). Fast, and directly counts individual stalls and vehicles; loses precision on densely packed lots.
+
+Implementation note: `parksight/detect.py` also exists in the repo but is an unused Grounding DINO (`IDEA-Research/grounding-dino-tiny`) zero-shot baseline from an earlier iteration, not the detector described above.
 
 ### 3. Geometric heuristics - layout simulation
 
